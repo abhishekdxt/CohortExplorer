@@ -1,0 +1,5 @@
+# avoid temp and backup files
+*~
+
+CohortExplorer-*
+
