@@ -3,697 +3,632 @@ package CohortExplorer::Command::Query;
 use strict;
 use warnings;
 
-our $VERSION = 0.13;
+our $VERSION = 0.14;
 our ( $COMMAND_HISTORY_FILE, $COMMAND_HISTORY_CONFIG, $COMMAND_HISTORY );
 our @EXPORT_OK = qw($COMMAND_HISTORY);
-my $ARG_MAX = 500;
+
+my $arg_max = 500;
 
 #-------
-
 BEGIN {
+ use base qw(CLI::Framework::Command Exporter);
+ use CLI::Framework::Exceptions qw( :all );
+ use CohortExplorer::Datasource;
+ use Exception::Class::TryCatch;
+ use FileHandle;
+ use File::HomeDir;
+ use File::Spec;
+ use Config::General;
 
-	use base qw(CLI::Framework::Command Exporter);
-	use CLI::Framework::Exceptions qw( :all );
-	use CohortExplorer::Datasource;
-	use Exception::Class::TryCatch;
-	use FileHandle;
-	use File::HomeDir;
-	use File::Spec;
-	use Config::General;
+ # Untaint and set command history file
+ $COMMAND_HISTORY_FILE = $1
+ if File::Spec->catfile( File::HomeDir->my_home, ".CohortExplorer_History" ) =~ /^(.+)$/;
+ 
+ my $fh = FileHandle->new(">> $COMMAND_HISTORY_FILE");
 
-	# Untaint and set command history file
-	$COMMAND_HISTORY_FILE = $1
-	  if (
-		File::Spec->catfile(
-			File::HomeDir->my_home, ".CohortExplorer_History"
-		) =~ /^(.+)$/
-	  );
+ # Throw exception if command history file does not exist or
+ # is not readable and writable
+ if ( !$fh ) {
+  throw_cmd_run_exception( error =>
+"'$COMMAND_HISTORY_FILE' must exist with RW enabled (i.e. chmod 766) for CohortExplorer"
+  );
+ }
+ $fh->close;
 
-	my $fh = FileHandle->new(">> $COMMAND_HISTORY_FILE");
-
-	# Throw exception if command history file does not exist or
-	# is not readable and writable
-	if ( !$fh ) {
-		throw_cmd_run_exception( error =>
-        "'$COMMAND_HISTORY_FILE' must exist with RW enabled (i.e. chmod 766) for CohortExplorer"
-		);
-	}
-	$fh->close;
-
-	# Read command history file
-	eval {
-		$COMMAND_HISTORY_CONFIG = Config::General->new(
-			-ConfigFile            => $COMMAND_HISTORY_FILE,
-			-MergeDuplicateOptions => "false",
-			-StoreDelimiter        => "=",
-			-SaveSorted            => 1
-		);
-	};
-
-	if ( catch my $e ) {
-		throw_cmd_run_exception( error => $e );
-	}
-
-	$COMMAND_HISTORY = { $COMMAND_HISTORY_CONFIG->getall };
-
+ # Read command history file
+ eval {
+  $COMMAND_HISTORY_CONFIG =
+    Config::General->new(
+                          -ConfigFile            => $COMMAND_HISTORY_FILE,
+                          -MergeDuplicateOptions => "false",
+                          -StoreDelimiter        => "=",
+                          -SaveSorted            => 1
+    );
+ };
+ if ( catch my $e ) {
+  throw_cmd_run_exception( error => $e );
+ }
+ $COMMAND_HISTORY = { $COMMAND_HISTORY_CONFIG->getall };
 }
 
 sub option_spec {
-
-	(
-		[],
-		[ 'cond|c=s%'      => 'impose conditions'        ],
-		[ 'out|o=s'        => 'provide output directory' ],
-		[ 'save-command|s' => 'save command'             ],
-		[ 'stats|S'        => 'show summary statistics'  ],
-		[ 'export|e=s@'    => 'export tables by name'    ],
-		[ 'export-all|a'   => 'export all tables'        ],
-		[]
-	);
+ (
+   [],
+   [ 'cond|c=s%'      => 'impose conditions' ],
+   [ 'out|o=s'        => 'provide output directory' ],
+   [ 'save-command|s' => 'save command' ],
+   [ 'stats|S'        => 'show summary statistics' ],
+   [ 'export|e=s@'    => 'export tables by name' ],
+   [ 'export-all|a'   => 'export all tables' ],
+   []
+ );
 }
 
 sub validate {
+ my ( $self, $opts, @args ) = @_;
+ my ( $ds, $csv, $verbose ) = @{ $self->cache->get('cache') }{qw/datasource csv verbose/};
+ 
+ print STDERR "\nValidating command options/arguments ...\n\n" if $verbose;
+ 
+ ##----- VALIDATE ARG LENGTH, EXPORT AND OUT OPTIONS -----##
+ if ( !$opts->{out} || !-d $opts->{out} || !-w $opts->{out} ) {
+  throw_cmd_validation_exception( error =>
+"Option 'out' is required. The directory specified in 'out' option must exist with RWX enabled (i.e. chmod 777) for CohortExplorer"
+  );
+ }
 
-	my ( $self, $opts, @args ) = @_;
+ 
+ if ( $opts->{export} && $opts->{export_all} ) {
+  throw_cmd_validation_exception( error =>
+      'Mutually exclusive options (export and export-all) specified together' );
+ }
+ if ( @args == 0 || @args > $arg_max ) {
+  throw_cmd_validation_exception(
+                      error => "At least 1-$arg_max variable(s) are required" );
+ }
+ 
+ # Match table names supplied in the export option to
+ # datasource tables and throw exception if they don't match
+ if ( $opts->{export} ) {
+  my @invalid_tables = grep { !$ds->table_info->{$_} } @{ $opts->export };
+  if (@invalid_tables) {
+   throw_cmd_validation_exception( error => 'Invalid table(s) ' . join ( ', ', @invalid_tables ) . ' in export' );
+  }
+ }
 
-	my $cache = $self->cache->get('cache');
+ # Set export to all tables
+ if ( $opts->{export_all} ) {
+  $opts->{export} = [ keys %{$ds->table_info} ];
+ }
 
-	eval 'require ' . ref $cache->{datasource};    # May or may not be preloaded
+ # --- VALIDATE CONDITION OPTION AND ARGS ---
+ # Get valid variables for validation
+ my @vars = @{ $self->get_valid_variables };
+ 
+ for my $v (@args) {
+  # Throw exception if entity_id/visit are supplied as an argument
+  if ( $v =~ /^(?:entity_id|visit)$/ ) {
+   throw_cmd_validation_exception( error =>
+"'entity_id' and 'visit' (if applicable) need not be supplied as arguments as they are already part of the query set"
+   );
+  }
 
-	print STDERR "\nValidating command options/arguments ...\n\n"
-	  if ( $cache->{verbose} );
+  # Throw exception if some invalid variable is supplied as an argument
+  if ( !grep( $_ eq $v, @vars ) ) {
+   throw_cmd_validation_exception(
+                                error => "Invalid variable '$v' in arguments" );
+  }
+ }
 
-	##----- VALIDATE ARG LENGTH, EXPORT AND OUT OPTIONS -----##
+ # Condition can be imposed on all variables including
+ # entity_id and visit (if applicable)
+ for my $v ( keys %{ $opts->{cond} } ) {
 
-	if ( !$opts->{out} || !-d $opts->{out} || !-w $opts->{out} ) {
-		throw_cmd_validation_exception( error =>
-                 "Option 'out' is required. The directory specified in 'out' option must exist with RWX enabled (i.e. chmod 777) for CohortExplorer"
-		);
-	}
+  # Throw exception if some invalid variable is supplied as argument
+  if ( !grep( $_ eq $v, @vars ) ) {
+   throw_cmd_validation_exception(
+                         error => "Invalid variable '$v' in condition option" );
+  }
 
-	if ( $opts->{export} && $opts->{export_all} ) {
-		throw_cmd_validation_exception( error =>
-                 "Mutually exclusive options (export and export-all) specified together"
-		);
-	}
+  # Regexp to validate condition option
+  if ( $opts->{cond}{$v} =~
+/^\s*(=|\!=|>|<|>=|<=|between|not_between|like|not_like|ilike|in|not_in|regexp|not_regexp)\s*,\s*([^\`]+)\s*$/
+    )
+  {
+   my ( $opr, $val ) = ( $1, $2 );
+   $opts->{cond}{$v} =~ s/$opr,\s+/$opr,/;
 
-	if ( @args == 0 || @args > $ARG_MAX ) {
-		throw_cmd_validation_exception(
-			error => "At least 1-$ARG_MAX variable(s) are required" );
-	}
-
-	my $ds = $cache->{datasource};
-
-	# Match table names supplied in the export option to
-	# datasource tables and throw exception if they don't match
-	if ( $opts->{export} ) {
-		my $tables = $ds->tables;
-		my @invalid_tables = grep { !$tables->{$_} } @{ $opts->export };
-
-		if (@invalid_tables) {
-			throw_cmd_validation_exception(
-				error => 'Invalid table(s) ' . join ', ',
-				@invalid_tables . ' in export'
-			);
-		}
-	}
-
-	# Set export to all tables
-	if ( $opts->{export_all} ) {
-		$opts->{export} = [ keys %{ $ds->tables } ];
-	}
-
-	# --- VALIDATE CONDITION OPTION AND ARGS ---
-
-	# Get valid variables for validation
-	my @var = @{ $self->get_valid_variables };
-
-	for my $v (@args) {
-
-		# Throw exception if entity_id/visit are supplied as an argument
-		if ( $v =~ /^(entity_id|visit)$/ ) {
-			throw_cmd_validation_exception( error =>
-                         "entity_id and visit (if applicable) are already part of the query set"
-			);
-		}
-
-		# Throw exception if some invalid variable is supplied as an argument
-		if ( !grep( $_ eq $v, @var ) ) {
-			throw_cmd_validation_exception(
-				error => "Invalid variable '$v' in arguments" );
-		}
-	}
-
-	my $csv = $cache->{csv};
-
-	# Condition can be imposed on all variables including
-	# entity_id and visit (if applicable)
-	for my $v ( keys %{ $opts->{cond} } ) {
-
-		# Throw exception if some invalid variable is supplied as argument
-		if ( !grep( $_ eq $v, @var ) ) {
-			throw_cmd_validation_exception(
-				error => "Invalid variable '$v' in condition option" );
-		}
-
-		# Regexp to validate condition option
-		if ( $opts->{cond}{$v} =~
-                     /^\s*(=|\!=|>|<|>=|<=|between|not_between|like|not_like|in|not_in|regexp|not_regexp)\s*,\s*([^\`]+)\s*$/
-		  )
-		{
-			my ( $opr, $val ) = ( $1, $2 );
-
-			# Remove space (if any) following the operator
-			$opts->{cond}{$v} =~ s/$opr,\s+/$opr,/;
-
-			# Validating SQL conditions
-			if ( $opr && $val && $csv->parse($val) ) {
-				my @val = grep ( s/^\s*|\s*$//g, $csv->fields );
+   # Validating SQL conditions
+   if ( $opr && $val && $csv->parse($val) ) {
+    my @val = grep ( s/^\s*|\s*$//g, $csv->fields );
 
     # Operators between and not_between require array but for others it is optional
-				if ( $opr =~ /(between)/ && scalar @val != 2 ) {
-					throw_cmd_validation_exception( error =>
-              "Expecting min and max for '$opr' in '$v' (i.e. 'between, min, max' )"
-					);
-				}
-			}
-
-			else {
-				throw_cmd_validation_exception(
-					error => "Invalid condition on variable '$v'" );
-			}
-		}
-
-		else {
-			throw_cmd_validation_exception(
-				error => "Invalid condition on variable '$v'" );
-		}
-	}
+    if ( $opr =~ /(?:between)/ && scalar @val != 2 ) {
+     throw_cmd_validation_exception( error =>
+         "Expecting min and max for '$opr' in '$v' (i.e. between, min, max )" );
+    }
+   }
+   else {
+    throw_cmd_validation_exception(
+            error => "Invalid condition '$opts->{cond}{$v}' on variable '$v'" );
+   }
+  }
+  else {
+   throw_cmd_validation_exception(
+            error => "Invalid condition '$opts->{cond}{$v}' on variable '$v'" );
+  }
+ }
 }
 
 sub run {
 
-	# Overall running of the command
-	my ( $self, $opts, @args ) = @_;
+ # Overall running of the command
+ my ( $self, $opts, @args ) = @_;
+ my $rs = $self->process( $opts, @args );
+ if ( $opts->{save_command} ) {
+      $self->save_command( $opts, @args );
+ }
 
-	my $rs = $self->process( $opts, @args );
+ # If result-set is not empty
+ if (@$rs) {
+  my $dir;
+  if ( $opts->{out} =~ /^(.+)$/ ) {
+   $dir = File::Spec->catdir( $1, 'CohortExplorer-' . time . $$ );
+  }
 
-	if ( $opts->{save_command} ) {
-		$self->save_command( $opts, @args );
-	}
-
-	# If result-set is not empty
-	if (@$rs) {
-
-		my $dir;
-
-		if ( $opts->{out} =~ /^(.+)$/ ) {
-			$dir = File::Spec->catdir( $1, 'CohortExplorer-' . time . $$ );
-		}
-
-		# Create dir to export data
-		eval { mkdir $dir };
-
-		if ( catch my $e ) {
-			warn $e . "\n";
-			$dir = $1;
-		}
-
-		else {
-
-			eval { chmod 0777, $dir };
-
-			if ( catch my $e ) {
-				warn $e . "\n";
-				$dir = $1;
-			}
-		}
-
-		$self->export( $opts, $rs, $dir, @args );
-
-		return {
-			headingText => 'summary statistics',
-			rows        => $self->summary_stats( $opts, $rs, $dir )
-		  }
-		  if ( $opts->{stats} );
-	}
-
-	return undef;
+  # Create dir to export data
+  eval { mkdir $dir };
+  if ( catch my $e ) {
+   warn $e . "\n";
+   $dir = $1;
+  }
+  else {
+   eval { chmod 0777, $dir };
+   if ( catch my $e ) {
+    warn $e . "\n";
+    $dir = $1;
+   }
+  }
+  $self->export( $opts, $rs, $dir, @args );
+  
+  return {
+           headingText => 'summary statistics',
+           rows        => $self->summary_stats( $opts, $rs, $dir )
+    }
+    if $opts->{stats};
+ }
+ return;
 }
 
 sub process {
-
-	my ( $self, $opts, @args ) = @_;
-
-	my $cache = $self->cache->get('cache');
-	my $ds    = $cache->{datasource};
-
-	##----- PREPARE QUERY PARAMETERS FROM CONDITION OPTION AND ARGS -----##
-
+ my ( $self, $opts, @args ) = @_;
+ my ( $ds, $verbose ) = @{ $self->cache->get('cache') }{qw/datasource verbose/};
+ 
+ ##----- PREPARE QUERY PARAMETERS FROM CONDITION OPTION AND ARGS -----##
  # Query parameters can be static, dynamic or both
- # Static type is applicable to 'standard' datasource but it may also be applicable
- # to 'longitudinal' datasource provided the datasource contains tables which
- # are independent of visits (i.e. static tables). Dynamic type only applies to
- # longitudinal datasources
-	my $params = $self->create_query_params( $opts, @args );
+ # Static type is applicable to 'standard' datasource but it may also apply to
+ # 'longitudinal' datasource provided the datasource contains tables which are
+ # independent of visits (i.e. static tables).
+ # Dynamic type only applies to longitudinal datasources
+ my $param = $self->create_query_params( $opts, @args );
+ my $aliase_in_having = 1 if $ds->dialect->name eq 'mysql';
+ my $dbh = $ds->dbh;
+ my ( $stmt, $vars, $sth, @rows );
+ 
+ # Construct sql query for static/dynamic or both types (if applicable)
+ for my $p ( keys %$param ) {
+  tie my %c, 'Tie::IxHash', @{ $param->{$p}{-columns} };
+  $param->{$p}{-columns} = [
+   map {
+        $c{$_} . ' AS '
+      . $dbh->quote_identifier($_)
+     } keys %c
+  ];
+  eval {
+   ( $param->{$p}{stmt}, @{ $param->{$p}{bind} } ) =
+     $ds->sqla->select( %{ $param->{$p} } );
+  };
+  if ( catch my $e ) {
+   throw_cmd_run_exception( error => $e );
+  }
 
-	my ( $stmt, $var, $sth, @rows );
+  # Filter literals from @bind. 'Visit' is not treated as a variable, only to
+  # avoid clash between the column and table name, what if some table is named as visit? (I saw one!!)
+  # Get all indices in @bind containing literals (i.e. variable/column names or undef)
+  my @bind = @{ $param->{$p}{bind} };
+  my @placeholders;
+  for ( 0 .. $#bind ) {
+   if ( ( $c{ $bind[$_] } && $bind[$_] ne 'visit' ) || $bind[$_] eq 'undef' ) {
+         push @placeholders, $_;
+   }
+  }
 
-	# Get comamnd name from ref
-	( my $command = lc ref $self ) =~ s/^.+:://;
+  # Remove variable names from placeholders as they need to be hard coded
+  if (@placeholders) {
+   for ( 0 .. $#placeholders ) {
+    my @chunks = split /\?/, $param->{$p}{stmt};
+    my $val = $bind[ $placeholders[$_] ];
+    my $literal = $aliase_in_having ? "`$val`" : ( $c{$val} || $val );
+    
+    $chunks[ $placeholders[$_] - $_ ] .= $literal;
+    $param->{$p}{stmt} = join '?', @chunks;
+    $param->{$p}{stmt} =~ s/([\w\)\"\`\'])\?/$1/g;
+    delete( $param->{$p}{bind}->[ $placeholders[$_] ] );
+   }
 
-	# Construct sql query for static/dynamic or both params (if applicable)
-	for my $p ( keys %$params ) {
-		eval {
-			( $params->{$p}{stmt}, @{ $params->{$p}{bind} } ) =
-			  $ds->sqla->select( %{ $params->{$p} } );
-		};
+   # Update @bind
+   @{ $param->{$p}{bind} } = grep( defined($_), @{ $param->{$p}{bind} } );
+  }
 
-		if ( catch my $e ) {
-			throw_cmd_run_exception( error => $e );
-		}
+  # undef needs to be hard coded as 'is null' or 'is not null'
+  # depending upon the operator (i.e. = or !=)
+  $param->{$p}{stmt} =~ s/\s+=\s+undef\s+/ IS NULL /g;
+  $param->{$p}{stmt} =~ s/\s+!=\s+undef\s+/ IS NOT NULL /g;
+  $vars->{$p} = [ map { $dbh->quote_identifier($_) } grep ( $_ ne 'entity_id', keys %c ) ];
+ }
 
-		# Store all variables from sql in hash
-		tie my %vars, 'Tie::IxHash',
-		  map { $_ => 1 }
-		  ( '`entity_id`', $params->{$p}{stmt} =~ /AS\s+(\`[^\`]+\`),?/g );
-
-		# Back quote all bind parameters except 'visit'. 'Visit' is not
-		# treated as a variable, only to avoid clash between the
-		# variable and table name, what if some table is called visit ??
-		my @backquoted_bind = map { s/\'//g; "`$_`" }
-		  grep ( $_ ne 'visit', @{ $params->{$p}{bind} } );
-
-		# Get all indices in @bind where variable names or undef is present
-		my @var_placeholder =
-		  grep ( defined $vars{ $backquoted_bind[$_] }
-			  || $backquoted_bind[$_] eq '`undef`',
-			0 .. $#backquoted_bind );
-
-		# Remove variable names from placeholders as they need to be hard coded
-		if (@var_placeholder) {
-			for ( 0 .. $#var_placeholder ) {
-				my $count = 0;
-				$params->{$p}{stmt} =~
-                s/(\?)/$count++ == $var_placeholder[$_]-$_ ? $backquoted_bind[$var_placeholder[$_]] : $1/ge;
-				delete( $params->{$p}{bind}->[ $var_placeholder[$_] ] );
-			}
-
-			# Update @bind after removal of variable names
-			@{ $params->{$p}{bind} } =
-			  grep( defined($_), @{ $params->{$p}{bind} } );
-		}
-
-		# undef needs to be hard coded as 'is null' or 'is not null'
-		# depending on the operator (i.e. = or !=)
-		$params->{$p}{stmt} =~ s/\s+=\s+\`undef\`\s+/ IS NULL /g;
-		$params->{$p}{stmt} =~ s/\s+!=\s+\`undef\`\s+/ IS NOT NULL /g;
-
-		delete $vars{'`entity_id`'};
-
-		$var->{$p} = [ keys %vars ];
-	}
-
-	# Either static or dynamic parameter
-	if ( keys %$params == 1 ) {
-		$stmt = $params->{ ( keys %$params )[0] }{stmt};
-	}
-
-	# Both static and dynamic parameters are present
-	else {
-
+ # Either static or dynamic parameter
+ if ( keys %$param == 1 ) {
+  $stmt = $param->{ ( keys %$param )[0] }{stmt};
+ }
+ else {
   # Give priority to visit dependent tables (i.e. dynamic tables) therefore do left join
-  # Inner join is done when conditions are imposed on static tables alone
-		$stmt =
-		    'SELECT dynamic.entity_id, '
-		  . join( ', ', map { @{ $var->{$_} } } keys %$var )
-		  . ' FROM '
-		  . join(
-			(
-				(
-					(
-						!$params->{static}{-having}{entity_id}
-						  && keys %{ $params->{static}{-having} } == 1
-					)
-					  || keys %{ $params->{static}{-having} } > 1
-				) ? ' INNER JOIN ' : ' LEFT OUTER JOIN '
-			),
-			map { "( " . $params->{$_}{stmt} . " ) AS $_" } keys %$params
-		  ) . ' ON dynamic.entity_id = static.entity_id';
-	}
+  # Inner join is done only when conditions are imposed on variables from static tables
+  $stmt =
+      'SELECT dynamic.entity_id, '
+    . join( ', ', map { @{ $vars->{$_} } } keys %$param )
+    . ' FROM '
+    . join(
+            (
+              (
+                (
+                  !$param->{static}{-having}{entity_id}
+                    && keys %{ $param->{static}{-having} } == 1
+                )
+                  || keys %{ $param->{static}{-having} } > 1
+              ) ? ' INNER JOIN ' : ' LEFT OUTER JOIN '
+            ),
+            map { "( " . $param->{$_}{stmt} . " ) AS $_" } keys %$param
+    ) . ' ON dynamic.entity_id = static.entity_id';
+ }
+ 
+ my @bind = map { @{ $param->{$_}{bind} } } keys %$param;
+ 
+ print STDERR "Running the query with "
+   . scalar @bind
+   . " bind variables ...\n\n"
+   if $verbose;
+ 
+ require Time::HiRes;
+ my $timeStart = Time::HiRes::time();
+ 
+ eval {
+  $sth = $dbh->prepare_cached($stmt);
+  $sth->execute(@bind);
+ };
+ 
+ if ( catch my $e ) {
+  throw_cmd_run_exception( error => $e );
+ }
+ 
+ my $timeEnd = Time::HiRes::time();
+ 
+ ( my $command = lc ref $self ) =~ s/^.+:://;
+ 
+ printf( "Found %d rows in %.2f sec matching the %s query criteria ...\n\n",
+         ( $sth->rows || 0 ),
+         ( $timeEnd - $timeStart ), $command )
+ if $verbose;
+ 
+ if ( $sth->rows ) {
+  my @cols = @{ $sth->{NAME} };
+  @rows = @{ $sth->fetchall_arrayref( [] ) };
 
-	my @bind = map { @{ $params->{$_}{bind} } } keys %$params;
-
-	print STDERR "Running the query with "
-	  . scalar @bind
-	  . " bind variables ...\n\n"
-	  if ( $cache->{verbose} );
-
-	require Time::HiRes;
-
-	my $timeStart = Time::HiRes::time();
-
-	eval {
-		$sth = $ds->dbh->prepare_cached($stmt);
-		$sth->execute(@bind);
-	};
-
-	if ( catch my $e ) {
-		throw_cmd_run_exception( error => $e );
-	}
-
-	my $timeEnd = Time::HiRes::time();
-
-	printf(
-		"Found %d rows in %.2f sec matching the %s query criteria ...\n\n",
-		( $sth->rows || 0 ),
-		( $timeEnd - $timeStart ), $command
-	) if ( $cache->{verbose} );
-
-	push @rows, ( $sth->{NAME}, @{ $sth->fetchall_arrayref( [] ) } )
-	  if ( $sth->rows );
-
-	$sth->finish;
-	return \@rows;
+  # Sort results by entity_id (entity_id can be number or text)
+  @rows =
+    DBI::looks_like_number( $rows[0]->[0] )
+    ? sort { $a->[0] <=> $b->[0] } @rows
+    : sort { $a->[0] cmp $b->[0] } @rows;
+  unshift @rows, \@cols;
+ }
+ $sth->finish;
+ return \@rows;
 }
 
 sub save_command {
+ my ( $self, $opts, @args ) = @_;
+ my ( $ds, $ds_name, $verbose ) = @{ $self->cache->get('cache') }{qw/datasource datasource_name verbose/};
+ my $count = scalar keys %{ $COMMAND_HISTORY->{datasource}{$ds_name} };
+ ( my $command = lc ref $self ) =~ s/^.+:://;
+ print STDERR "Saving command ...\n\n" if $verbose;
+ require POSIX;
 
-	my ( $self, $opts, @args ) = @_;
-	my $cache = $self->cache->get('cache');
-	my $alias = $cache->{datasource}->alias;
-	my $count = scalar keys %{ $COMMAND_HISTORY->{datasource}{$alias} };
-	( my $command = lc ref $self ) =~ s/^.+:://;
+ # Remove the save-command option
+ delete $opts->{save_command};
 
-	print STDERR "Saving command ...\n\n" if ( $cache->{verbose} );
-
-	require POSIX;
-
-	# Remove the save-command option
-	delete $opts->{save_command};
-
-	# Construct the command run by the user and store it in $COMMAND_HISTORY
-	for my $opt ( keys %$opts ) {
-		if ( ref $opts->{$opt} eq 'ARRAY' ) {
-			$command .= " --$opt=" . join( " --$opt=", @{ $opts->{$opt} } );
-		}
-		elsif ( ref $opts->{$opt} eq 'HASH' ) {
-			$command .= join( ' ',
-				map ( "--$opt=$_='$opts->{$opt}{$_}' ",
-					keys %{ $opts->{$opt} } ) );
-		}
-		else {
-			( $_ = $opt ) =~ s/_/-/g;
-			$command .= " --$_=$opts->{$opt} ";
-			$command =~ s/($_)=1/$1/
-			  if ( $opts->{export_all} || $opts->{stats} );
-		}
-	}
-
-	$command .= ' ' . join( ' ', @args );
-	$command =~ s/\-\-export=[^\s]+\s*/ /g if ( $opts->{export_all} );
-	$command =~ s/\s+/ /g;
-
-	for ( keys %{ $COMMAND_HISTORY->{datasource} } ) {
-		$COMMAND_HISTORY->{datasource}{$_}{ ++$count } = {
-			datetime => POSIX::strftime( '%d/%m/%Y %T', localtime ),
-			command  => $command
-		  }
-		  if ( $_ eq $alias );
-
-	}
+ # Construct the command run by the user and store it in $COMMAND_HISTORY
+ for my $opt ( keys %$opts ) {
+  if ( ref $opts->{$opt} eq 'ARRAY' ) {
+   $command .= " --$opt=" . join( " --$opt=", @{ $opts->{$opt} } );
+  }
+  elsif ( ref $opts->{$opt} eq 'HASH' ) {
+   $command .= join( ' ',
+                     map { "--$opt=$_='$opts->{$opt}{$_}' " }
+                       keys %{ $opts->{$opt} } );
+  }
+  else {
+   ( $_ = $opt ) =~ s/_/-/g;
+   $command .= " --$_=$opts->{$opt} ";
+   $command =~ s/($_)=1/$1/ if $opts->{export_all} || $opts->{stats};
+  }
+ }
+ $command .= ' ' . join( ' ', @args );
+ $command =~ s/\-\-export=[^\s]+\s*/ /g if $opts->{export_all};
+ $command =~ s/\s+/ /g;
+ for ( keys %{ $COMMAND_HISTORY->{datasource} } ) {
+  if ( $_ eq $ds_name ) {
+   $COMMAND_HISTORY->{datasource}{$_}{ ++$count } = {
+                        datetime => POSIX::strftime( '%d/%m/%Y %T', localtime ),
+                        command  => $command
+   };
+  }
+ }
 }
 
 sub export {
+ my ( $self, $opts, $rs, $dir, @args ) = @_;
+ my ( $ds, $verbose ) = @{ $self->cache->get('cache') }{qw/datasource verbose/};
+ 
+ ##---- WRITE QUERY PARAMETERS FILE -----##
+ my $file = File::Spec->catfile( $dir, 'QueryParameters' );
+ my $fh = FileHandle->new("> $file") or throw_cmd_run_exception( error => "Failed to open file: $!" );
+ 
+ print $fh "Query Parameters" . "\n\n";
+ print $fh "Arguments supplied: " . join( ', ', @args ) . "\n\n";
+ print $fh "Conditions imposed: " . scalar( keys %{ $opts->{cond} } ) . "\n\n";
+ my @vars = keys %{ $opts->{cond} };
 
-	my ( $self, $opts, $rs, $dir, @args ) = @_;
+ # Write all imposed conditions
+ for ( 0 .. $#vars ) {
+  $opts->{cond}{ $vars[$_] } =~ /^\s*([^,]+),\s*(.+)\s*$/;
+  print $fh ( $_ + 1 ) . ") $vars[$_]: '$1' => $2" . "\n";
+ }
 
-	my $cache = $self->cache->get('cache');
+ # Write all tables to be exported
+ print $fh "\n"
+   . "Tables exported: "
+   . ( $opts->{export} ? join ', ', @{ $opts->{export} } : 'None' ) . "\n";
+ $fh->close;
+ 
+ print STDERR "Exporting query results in $dir ...\n\n" if $verbose;
 
-	##---- WRITE QUERY PARAMETERS FILE -----##
-
-	my $file = File::Spec->catfile( $dir, "QueryParameters" );
-
-	my $fh = FileHandle->new("> $file")
-	  or throw_cmd_run_exception( error => "Failed to open file: $!" );
-
-	print $fh "Query Parameters" . "\n\n";
-	print $fh "Arguments supplied: " . join( ', ', @args ) . "\n\n";
-	print $fh "Conditions imposed: "
-	  . scalar( keys %{ $opts->{cond} } ) . "\n\n";
-
-	my @var = keys %{ $opts->{cond} };
-
-	# Write all imposed conditions
-	for ( 0 .. $#var ) {
-		$opts->{cond}{ $var[$_] } =~ /^\s*([^,]+),\s*(.+)\s*$/;
-		print $fh ( $_ + 1 ) . ") $var[$_]: '$1' => $2" . "\n";
-	}
-
-	# Write all tables to be exported
-	print $fh "\n"
-	  . "Tables exported: "
-	  . ( $opts->{export} ? join ', ', @{ $opts->{export} } : 'None' ) . "\n";
-
-	$fh->close;
-
-	print STDERR "Exporting query results in $dir ...\n\n"
-	  if ( $cache->{verbose} );
-
-	# Process result set and get entities in the result set
-	my $rs_entity = $self->process_result( $opts, $rs, $dir, @args );
-
-	if ( $opts->{export} ) {
-		my $ds = $cache->{datasource};
-		my ( $stmt, @bind, $sth );
-		my $struct = $ds->entity_structure;
-
-		# Get column names-SQL pairs
-		$struct->{-columns} = $ds->entity_columns;
+ # Process result set and get entities in the result set
+ my $rs_entity = $self->process_result( $opts, $rs, $dir, @args );
+ if ( $opts->{export} ) {
+  my ( $stmt, @bind, $sth );
+  my $struct = $ds->entity_structure;
+  my %map    = @{ $struct->{-columns} };
 
   # Construct sql query with a placeholder for table name
   # Columns follow the order: entity_id, variable, value and visit (if applicable)
-		eval {
-			( $stmt, @bind ) = $ds->sqla->select(
-				-columns => [
-					map { $struct->{-columns}{$_} || 'NULL' }
-					  qw/entity_id variable value visit/
-				],
-				-from  => $struct->{-from},
-				-where => {
-					%{ $struct->{-where} },
-					$struct->{-columns}{table} => { '=' => '?' }
-				}
-			);
-		};
+  eval {
+   ( $stmt, @bind ) =
+     $ds->sqla->select(
+            -columns =>
+              [ map { $map{$_} || 'NULL' } qw/entity_id variable value visit/ ],
+            -from  => $struct->{-from},
+            -where => { %{ $struct->{-where} }, $map{table} => { '=' => '?' } }
+     );
+  };
+  if ( catch my $e ) {
+   throw_cmd_run_exception( error => $e );
+  }
 
-		if ( catch my $e ) {
-			throw_cmd_run_exception( error => $e );
-		}
-
-		$sth = $ds->dbh->prepare_cached($stmt);
+  $sth = $ds->dbh->prepare_cached($stmt);
 
   # The user might have supplied multiple conditions in the where clause
   # of entity_structure() method so split the $stmt by '?' and get the index of
   # 'table' placeholder
-		my @chunk = split /\?/, $stmt;
-		my ($placeholder) =
-		  grep ( $chunk[$_] =~ /\s+$struct->{-columns}{table}\s+=\s+/,
-			0 .. $#chunk );
-
-		for my $table ( @{ $opts->{export} } ) {
+  my @chunks = split /\?/, $stmt;
+  my ($placeholder) = grep ( $chunks[$_] =~ /\s+$map{table}\s+=\s+/, 0 .. $#chunks );
+  for my $table ( @{ $opts->{export} } ) {
 
    # Ensure the user has access to at least one variable in the table to be exported
-			if ( grep ( /^$table\..+$/, keys %{ $ds->variables } ) ) {
+   if ( grep ( /^$table\..+$/, keys %{ $ds->variable_info } ) ) {
+    $bind[$placeholder] = $table;
+    eval { $sth->execute(@bind); };
+    if ( catch my $e ) {
+     throw_cmd_run_exception( error => $e );
+    }
+    
+    my $rows = $sth->fetchall_arrayref( [] );
+    $sth->finish;
+    
+    if (@$rows) {
+     print STDERR "Exporting $table ...\n\n" if $verbose;
+     my $subdir = File::Spec->catdir( $dir, $table );
 
-				# Bind table name
-				$bind[$placeholder] = $table;
+     # Create dir to export data
+     eval { mkdir $subdir };
+     if ( catch my $e ) {
+      warn $e . "\n";
+      $dir = $1;
+     }
 
-				eval { $sth->execute(@bind); };
+     # Write metadata
+     $self->export_metadata( $table, $subdir );
 
-				if ( catch my $e ) {
-					throw_cmd_run_exception( error => $e );
-				}
-
-				my $rows = $sth->fetchall_arrayref( [] );
-				$sth->finish;
-
-				if (@$rows) {
-
-					print STDERR "Exporting $table ...\n\n"
-					  if ( $cache->{verbose} );
-
-					# Process table set
-					$self->process_table( $table, $rows, $dir, $rs_entity );
-				}
-				else {
-					print STDERR "Omitting $table (no entities) ...\n\n"
-					  if ( $cache->{verbose} );
-				}
-
-			}
-			else {
-				print STDERR "Omitting $table (no variables) ...\n\n"
-				  if ( $cache->{verbose} );
-			}
-		}
-
-	}
+     # Process table set
+     $self->process_table( $table, $rows, $subdir, $rs_entity );
+    }
+    else {
+     print STDERR "Omitting $table (no entities) ...\n\n"
+       if $verbose;
+    }
+   }
+   else {
+    print STDERR "Omitting $table (no variables) ...\n\n"
+      if $verbose;
+   }
+  }
+ }
 }
 
 sub summary_stats {
+ my ( $self, $opts, $rs, $dir ) = @_;
+ my ( $ds, $csv, $verbose ) = @{ $self->cache->get('cache') }{qw/datasource csv verbose/};
+ print STDERR "Preparing dataset for summary statistics ...\n\n"
+ if $verbose;
 
-	my ( $self, $opts, $rs, $dir ) = @_;
+ # Create data for calculating summary statistics from the result set
+ my ( $data, $key_index, @cols ) = $self->create_dataset($rs);
+ my $var_info = $ds->variable_info;
 
-	my $cache = $self->cache->get('cache');
+ # Open a file for writing descriotive statistics
+ my $file = File::Spec->catfile( $dir, "SummaryStatistics.csv" );
+ my $fh = FileHandle->new("> $file") or throw_cmd_run_exception( error => "Failed to open file: $!" );
+ $csv->print( $fh, \@cols ) or throw_cmd_run_exception( error => $csv->error_diag );
+ push my @stats, [@cols];
 
-	print STDERR "Preparing dataset summary statistics ...\n\n"
-
-	  if ( $cache->{verbose} );
-
-	# Create data for calculating summary statistics from the result set
-	my ( $data, $key_index, @column ) = $self->create_dataset($rs);
-
-	my $vars = $cache->{datasource}->variables;
-
-	# Open a file for writing descriotive statistics
-	my $file = File::Spec->catfile( $dir, "SummaryStatistics.csv" );
-
-	my $fh = FileHandle->new("> $file")
-	  or throw_cmd_run_exception( error => "Failed to open file: $!" );
-
-	my $csv = $cache->{csv};
-
-	$csv->print( $fh, \@column )
-	  or throw_cmd_run_exception( error => $csv->error_diag );
-
-	push my @summary_stats, [@column];
-
-	# Sort keys (i.e. visit/entity_id) according to their type (text/number)
-	my @keys =
-	  ( keys %$data )[-1] =~ /^[0-9]+$/
-	  ? sort { $a <=> $b } keys %$data
-	  : sort keys %$data;
-
-	@column = $key_index == 0 ? @column : splice @column, 1;
-
-	print STDERR "calculating summary statistics for "
-	  . ( $#column + 1 )
-	  . " query variable(s): "
-	  . join( ', ', @column )
-	  . " ... \n\n"
-	  if ( $cache->{verbose} );
+ # Sort keys (i.e. visit/entity_id) according to their type (text/number)
+ my @keys =
+   DBI::looks_like_number( ( keys %$data )[-1] )
+   ? sort { $a <=> $b } keys %$data
+   : sort keys %$data;
+ 
+ @cols = $key_index == 0 ? @cols : splice @cols, 1;
+ 
+ print STDERR "calculating summary statistics for "
+   . ( $#cols + 1 )
+   . ' query variable(s): '
+   . join( ', ', @cols )
+   . " ... \n\n"
+   if $verbose;
 
   # Key can be entity_id, visit or none depending on the command (i.e. search/compare) run.
   # For longitudinal datasources the search command calculates statistics with respect to visit,
   # hence the key is visit. Standard datasources are not visit based so no key is used.
   # Compare command uses entity_id as the key when calculating statistics for longitudinal datasources.
-	 require Statistics::Descriptive;
+  
+  require Statistics::Descriptive;
+  
+  for my $key (@keys) {
+  push my @rows, ( $key_index == 0 ? () : $key );
+  for my $c (@cols) {
+   my $sdf = Statistics::Descriptive::Full->new;
 
-	for my $key (@keys) {
-		push my @row, ( $key_index == 0 ? () : $key );
-		for my $c (@column) {
-			my $sdf = Statistics::Descriptive::Full->new;
+   # Calculate statistics for categorical variables with type 'text' and boolean variables only
+   if (    $var_info->{$c}
+           && $var_info->{$c}{category} )
+   {
+    my $N = @{ $data->{$key}{$c} } || 1;
+    tie my %category, 'Tie::IxHash',
+      map { /^([^,]+),\s*(.+)$/, $1 => $2 } split /\s*\n\s*/,
+      $var_info->{$c}{category};
 
-			# Calculate statistics for integer/decimal variables
-			if (   $vars->{$c}
-				&& ( $vars->{$c}{type} =~ /(signed|decimal)/i )
-				&& scalar @{ $data->{$key}{$c} } > 0 )
-			{
+    # Order of categories should remain the same
+    tie my %count, 'Tie::IxHash', map { $_ => 0 } keys %category;
 
-				# Remove single/double quotes (if any) from the numeric array
-				$sdf->add_data( map { s/[\'\"]+//; $_ }
-					  @{ $data->{$key}{$c} } );
+    # Get break-down by each category
+    for ( @{ $data->{$key}{$c} } ) {
+     $count{$_}++;
+    }
+    push @rows,
+      sprintf( "N: %1s\n", scalar @{ $data->{$key}{$c} } ) . join "\n", map {
+     sprintf( ( $category{$_} || $_ ) . "\: %d (%1.2f%s",
+              $count{$_}, $count{$_} * 100 / $N, '%)' )
+      } keys %count;
+   }
 
-				eval {
-					push @row,
-					  sprintf(
-                                                "N: %3s\nMean: %.2f\nMedian: %.2f\nSD: %.2f\nMax: %.2f\nMin: %.2f",
-						$sdf->count, $sdf->mean, $sdf->median,
-						$sdf->standard_deviation, $sdf->max, $sdf->min );
-				};
+   # Calculate statistics for integer/decimal variables
+   elsif (
+        $var_info->{$c}
+        && ( $var_info->{$c}{type} =~
+             /(signed|decimal|int|float|numeric|real|double)/i )
+        && scalar @{ $data->{$key}{$c} } > 0
+     )
+   {
 
-				if ( catch my $e ) {
-					throw_cmd_run_exception($e);
-				}
-			}
-
-  # Calculate statistics for categorical variables with type 'text' and boolean variables only
-			elsif ($vars->{$c}
-				&& $vars->{$c}{type} =~ /^char/i
-				&& $vars->{$c}{category} )
-			{
-				my $N = @{ $data->{$key}{$c} } || 1;
-
-				tie my %category, 'Tie::IxHash',
-				  map { /^([^,]+),\s*(.+)$/, $1 => $2 } split /\s*\n\s*/,
-				  $vars->{$c}{category};
-
-				# Order of categories should remain the same
-				tie my %count, 'Tie::IxHash', map { $_ => 0 } keys %category;
-
-				# Get break-down by each category
-				for ( @{ $data->{$key}{$c} } ) {
-					$count{$_}++;
-				}
-
-				push @row,
-				  sprintf( "N: %1s\n", scalar @{ $data->{$key}{$c} } )
-				  . join "\n", map {
-					sprintf( ( $category{$_} || $_ ) . "\: %d (%1.2f%s",
-						$count{$_}, $count{$_} * 100 / $N, '%)' )
-				  } keys %count;
-			}
+    # Remove single/double quotes (if any) from the numeric array
+    $sdf->add_data( map { s/[\'\"]+//; $_ } @{ $data->{$key}{$c} } );
+    eval {
+     push @rows,
+       sprintf(
+             "N: %3s\nMean: %.2f\nMedian: %.2f\nSD: %.2f\nMax: %.2f\nMin: %.2f",
+             $sdf->count, $sdf->mean, $sdf->median, $sdf->standard_deviation,
+             $sdf->max, $sdf->min );
+    };
+    if ( catch my $e ) {
+     throw_cmd_run_exception($e);
+    }
+   }
 
    # For all other variable types (e.g. date, datetime) get no. of observations alone
-			else {
-				push @row, sprintf( "N: %3s\n", scalar @{ $data->{$key}{$c} } );
-			}
-		}
+   else {
+    push @rows, sprintf( "N: %3s\n", scalar @{ $data->{$key}{$c} } );
+   }
+  }
+  $csv->print( $fh, \@rows )
+    or throw_cmd_run_exception( error => $csv->error_diag );
+  push @stats, [@rows];
+ }
+ $fh->close;
+ return \@stats;
+}
 
-		$csv->print( $fh, \@row )
-		  or throw_cmd_run_exception( error => $csv->error_diag );
+sub export_metadata {
+ my ( $self, $table, $dir ) = @_;
+ my ( $ds, $csv ) = @{ $self->cache->get('cache') }{qw/datasource csv/};
+ my $var_info = $ds->variable_info;
 
-		push @summary_stats, [@row];
-	}
-
-	$fh->close;
-
-	return \@summary_stats;
-
+ # First two columns are always variable and table names
+ my @cols = qw/variable table/;
+ for ( keys %{ { @{ $ds->variable_structure->{-columns} } } } ) {
+  if ( $_ ne 'variable' && $_ ne 'table' ) {
+   push @cols, $_;
+  }
+ }
+ my $file = File::Spec->catfile( $dir, 'variables.csv' );
+ my $untaint = $1 if ( $file =~ /^(.+)$/ );
+ 
+ my $fh = FileHandle->new("> $untaint") or throw_cmd_run_exception( error => "Failed to open file: $!" );
+ $csv->print( $fh, \@cols ) or throw_cmd_run_exception( error => $csv->error_diag );
+ 
+ for my $v ( keys %$var_info ) {
+  if ( $var_info->{$v}{table} eq $table ) {
+   my @vals = map { $var_info->{$v}{$_} || '' } @cols;
+   $csv->print( $fh, \@vals ) or throw_cmd_run_exception( error => $csv->error_diag );
+  }
+ }
+ $fh->close;
 }
 
 #------------- SUBCLASSES HOOKS -------------#
-
-sub usage_text { }
+sub usage_text          { }
 
 sub get_valid_variables { }
 
 sub create_query_params { }
 
-sub process_result { }
+sub process_result      { }
 
-sub process_table { }
+sub process_table       { }
 
-sub create_dataset { }
+sub create_dataset      { }
 
 END {
 
-	# Write saved commands to command history file
-	eval {
-		$COMMAND_HISTORY_CONFIG->save_file( $COMMAND_HISTORY_FILE,
-			$COMMAND_HISTORY );
-	};
-
-	if ( catch my $e ) {
-		throw_cmd_run_exception( error => $e );
-	}
-
+ # Write saved commands to command history file
+ eval {
+  $COMMAND_HISTORY_CONFIG->save_file( $COMMAND_HISTORY_FILE, $COMMAND_HISTORY );
+ };
+ if ( catch my $e ) {
+  throw_cmd_run_exception( error => $e );
+ }
 }
-
+ 
 #-------
 1;
-
 __END__
 
 =pod
@@ -778,6 +713,16 @@ C<$rs> is the result set obtained upon executing the SQL query.
 C<$dir> is the export directory.
 
 C<@args> arguments to the command.
+
+=head2 export_metadata( $table, $dir )
+
+This method writes table metadata (i.e. variable dictionary) in the export directory.
+
+In this method,
+
+C<$table> is the name of the table to be exported.
+
+C<$dir> is the export directory.
 
 =head2 process_table( $table, $ts, $dir, $rs_entity )
 

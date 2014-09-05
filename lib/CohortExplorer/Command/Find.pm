@@ -3,182 +3,133 @@ package CohortExplorer::Command::Find;
 use strict;
 use warnings;
 
-our $VERSION = 0.13;
+our $VERSION = 0.14;
 
 use base qw(CLI::Framework::Command);
 use CLI::Framework::Exceptions qw( :all );
 use Exception::Class::TryCatch;
 
 #-------
-
 sub usage_text {
-
-	      q{
-           find [--fuzzy|f] [--ignore-case|i] [--and|a] [keyword] : find variables using keywords
+ q{
+     find [--fuzzy|f] [--ignore-case|i] [--and|a] [keyword] : find variables using keywords
 
          
-           By default, the command returns variables that contain either of the keywords in at least one of their attributes.
-           The user can override this setting by specifying 'and' option.
+     By default, the command returns variables that contain either of the keywords in at least one of their attributes.
+     The user can override this setting by specifying 'and' option.
 
-           EXAMPLES
+     EXAMPLES
              
-             find --fuzzy --ignore-case cancer diabetes mmhg  (fuzzy and case insensitive search)
+       find --fuzzy --ignore-case cancer diabetes mmhg  (fuzzy and case insensitive search)
 
-             find Demographics  (exact search)
+       find Demographics  (exact search)
 
-             find -fia mmse total (using AND operation with bundling and aliases)
-        };
+       find -fia mmse total (using AND operation with bundling and aliases)
+  };
 }
 
 sub option_spec {
-
-	(
-		[],
-		[ 'ignore-case|i' => 'ignore case' ],
-		[ 'fuzzy|f'       => 'fuzzy search' ],
-		[], [ 'and|a' => 'Join keywords using AND (default OR)' ], 
-		[]
-	);
+ (
+   [],
+   [ 'ignore-case|i' => 'ignore case' ],
+   [ 'fuzzy|f'       => 'fuzzy search' ],
+   [], 
+   [ 'and|a' => 'Join keywords using AND (default OR)' ], 
+   []
+ );
 }
 
 sub validate {
-
-	my ( $self, $opts, @args ) = @_;
-
-	if ( @args == 0 ) {
-		throw_cmd_validation_exception(
-			error => "At least one argument is required" );
-	}
+ my ( $self, $opts, @args ) = @_;
+ if ( @args == 0 ) {
+  throw_cmd_validation_exception(
+     error => 'At least one argument/keyword is required to run this command' );
+ }
 }
 
 sub run {
+ my ( $self, $opts, @args ) = @_;
+ my ( $ds, $verbose ) = @{ $self->cache->get('cache') }{qw/datasource verbose/};
+ my $oper = $opts->{ignore_case} ? ( $ds->dialect->ilike || 'ilike' ) : ( $ds->dialect->like || 'like' );
 
-	my ( $self, $opts, @args ) = @_;
-	my ( $ds, $verbose ) =
-	  @{ $self->cache->get('cache') }{qw/datasource verbose/};
-	my $oper = $opts->{ignore_case} ? -like : 'like binary';
+ # Case insensitive matching
+ @args = map { uc $_ } @args if $opts->{ignore_case};
 
-	# Convert all arguments to upper case for case insensitive match
-	@args = map { uc $_ } @args if ( $opts->{ignore_case} );
+ # Fuzzy matching
+ @args = map { '%' . $_ . '%' } @args if $opts->{fuzzy};
+ my $struct = $ds->variable_structure;
+ my %map    = @{ $struct->{-columns} };
 
-	# Add wildcard characters to each argument for fuzzy matching
-	@args = map { '%' . $_ . '%' } @args if ( $opts->{fuzzy} );
+ # Set the condition key
+ my $cond_key = $struct->{-group_by} ? -having : -where;
 
-	# May or may not be preloaded
-	eval 'require ' . ref $ds;
+ # Get the existing 'OR' within $struct (if any)
+ my $OR_cond = $struct->{$cond_key}{-or};
+ my @conds;
 
-	# Get variable structure
-	my $struct = $ds->variable_structure;
-
-	# Get column names-SQL pairs
-	my $map = $ds->variable_columns;
-
-	# Set the condition key to be used
-	my $condition_key = $struct->{-group_by} ? -having : -where;
-
-	# Get the existing 'OR' within $struct (if any)
-	my $OR_condition = $struct->{$condition_key}{-or};
-
- # By default assume the user is interested in finding variables which contain at least one of the
+ # By default, assume the user is interested in finding variables which contain at least one of the
  # supplied keywords in at least one of the variable attributes
- # If there is already a 'OR' within $struct->{$condition_key} then merge two conditions
- $struct->{ $struct->{-group_by} ? -having : -where }{-or} = [
-		map {
-			{
-				$opts->{ignore_case} ? "UPPER($_)" : $_ => [
-					( $opts->{'and'} ? '-and' : '-or' ) => map {
-						{ $oper => $_ }
-					  } @args
-				  ]
-			}
+ # If there is already an 'OR' within $struct->{$condition_key} then merge two conditions
+ for my $val ( values %map ) {
+    push @conds, { $val => [ ( $opts->{'and'} ? '-and' : '-or' ) => map { { $oper => $_ } } @args ] };
+ }
 
-		  } $struct->{-group_by}
-		? map { "`$_`" } keys %$map
-		: values %$map
-	];
+ $struct->{ $struct->{-group_by} ? -having : -where }{-or} = \@conds;
 
-	# Do a merger of old and new 'OR'
-	if ($OR_condition) {
-		$struct->{$condition_key}{-or} =
-		  $struct->{$condition_key}
-		  { [ -or => $struct->{$condition_key}{-or}, $OR_condition ] };
-	}
+ # Do a merger of old and new 'OR'
+ if ($OR_cond) {
+  $struct->{$cond_key}{-or} =
+    $struct->{$cond_key}
+    { [ -or => $struct->{$cond_key}{-or}, $OR_cond ] };
+ }
 
-	# Set table and variable as first two columns
-	push my @column, qw/variable table/;
+ # Set table and variable as first two columns
+ push my @cols, qw/variable table/;
+ for ( keys %map ) {
+  if ( $_ ne 'variable' && $_ ne 'table' ) {
+   push @cols, $_;
+  }
+ }
 
-	for ( keys %$map ) {
-		if ( $_ ne 'variable' && $_ ne 'table' ) {
-			push @column, $_;
-		}
-	}
+ my $dbh  = $ds->dbh;
 
-	# Format column name-SQL pairs along the lines of columns in
-	# SQL::Abstract::More
-	$struct->{-columns} = [ map { "$map->{$_}|`$_`" } @column ];
+ # Format column name-SQL pairs as per SQL::Abstract::More
+ $struct->{-columns} = [ map { $map{$_} . ' AS ' . $dbh->quote_identifier($_) } @cols ];
+ 
+ ##----- SQL TO FETCH VARIABLE DATA -----##
+ my ( $stmt, @bind, $sth, $rows );
+ 
+ eval { ( $stmt, @bind ) = $ds->sqla->select(%$struct); };
+ if ( catch my $e ) {
+  throw_cmd_run_exception( error => $e );
+ }
 
-	##----- SQL TO FETCH VARIABLE DATA -----##
-
-	my ( $stmt, @bind, $sth, $row );
-
-	eval { ( $stmt, @bind ) = $ds->sqla->select(%$struct); };
-
-	if ( catch my $e ) {
-		throw_cmd_run_exception( error => $e );
-	}
-
- # Modify query to allow case insensitve search for tables that store metadata in EAV format (e.g. Opal)
-	my $order_by = $1 if ( $stmt =~ /(ORDER BY\s+.+)$/ );
-	$stmt =~ s/ORDER BY .+$//;
-
-	my $where = $1 if ( $stmt =~ /HAVING(\s+.+)$/ );
-	$stmt =~ s/HAVING .+$//;
-
-	$stmt .= $order_by;
-	$stmt =
-	    'SELECT '
-	  . join( ', ', map { "`$_`" } @column )
-	  . " FROM ( $stmt ) AS custom ";
-	$stmt .= "WHERE $where " if ($where);
-
-	eval {
-		$row = $ds->dbh->selectall_arrayref( $stmt, undef, @bind );
-
-	};
-
-	if ( catch my $e ) {
-		throw_cmd_run_exception( error => $e );
-	}
-
-	if (@$row) {
-
-		# Add column names
-		unshift @$row, [@column];
-
-		print STDERR
-		  "\nFound $#$row variable(s) matching the find query criteria ...\n\n"
-		  . "Rendering variable description ...\n\n"
-		  if ($verbose);
-
-		return {
-			headingText => 'variable description',
-			rows        => $row
-		};
-	}
-
-	else {
-		print STDERR
-		  "\nFound 0 variable(s) matching the find query criteria ...\n\n"
-		  if ($verbose);
-
-		return undef;
-	}
-
+ eval { $rows = $dbh->selectall_arrayref( $stmt, undef, @bind ); };
+ if ( catch my $e ) {
+  throw_cmd_run_exception( error => $e );
+ }
+ 
+ if (@$rows) {
+  # Add column names
+  unshift @$rows, \@cols;
+  print STDERR
+    "\nFound $#$rows variable(s) matching the find query criteria ...\n\n"
+    . "Rendering variable description ...\n\n"
+    if $verbose;
+  return {
+           headingText => 'variable description',
+           rows        => $rows
+  };
+ }
+ else {
+  print STDERR "\nFound 0 variable(s) matching the find query criteria ...\n\n"
+    if $verbose;
+  return;
+ }
 }
 
 #-------
 1;
-
 __END__
 
 =pod

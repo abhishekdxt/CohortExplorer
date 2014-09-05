@@ -1,71 +1,64 @@
 package CohortExplorer::Command::Help;
-use base qw( CLI::Framework::Command::Meta );
 
 use strict;
 use warnings;
 
-our $VERSION = 0.13;
+our $VERSION = 0.14;
+
+use base qw( CLI::Framework::Command::Meta );
+
 
 #-------
-
 sub usage_text {
-
-	       q{
-           help [command]: application or command specific usage
-         };
+ q{
+     help [command]: application or command specific usage
+  };
 }
 
 sub run {
+ my ( $self, $opts, @args ) = @_;
 
-	my ( $self, $opts, @args ) = @_;
+ # Metacommand is app-aware
+ my $app = $self->get_app;
+ my $usage;
+ my $command_name = shift @args;
 
-	# Metacommand is app-aware
-	my $app = $self->get_app;
+ # Recognise help requests that refer to the target command by an alias
+ my %alias = $app->command_alias;
+ $command_name = $alias{$command_name} if $command_name && exists $alias{$command_name};
+ my $h = $app->command_map_hashref;
 
-	my $usage;
-	my $command_name = shift @args;
+ # First, attempt to get command-specific usage
+ if ($command_name) {
 
-	# Recognise help requests that refer to the target command by an alias
-	my %alias = $app->command_alias;
+  # (do not show command-specific usage message for non-interactive
+  # commands when in interactive mode)
+  $usage = $app->usage( $command_name, @args )
+    unless ( $app->get_interactivity_mode
+             && !$app->is_interactive_command($command_name) );
+ }
+ my $app_usage = $app->usage;
 
-	$command_name = $alias{$command_name}
-	  if ( $command_name && exists $alias{$command_name} );
+ # Remove usage of invalid/noninteractive commands from application help
+ for ( $app->noninteractive_commands ) {
+  if (
+      (
+       $_ =~ /^(?:search|compare|history)$/ && !$app->is_interactive_command($_)
+      )
+      || ( $_ =~ /^(?:menu|console)$/ && $app->get_interactivity_mode )
+    )
+  {
+   $app_usage =~ s/\n\s+$_\s+\-[^\n]+//;
+  }
+ }
 
-	my $h = $app->command_map_hashref;
-
-	# First, attempt to get command-specific usage
-	if ($command_name) {
-
-		# (do not show command-specific usage message for non-interactive
-		# commands when in interactive mode)
-		$usage = $app->usage( $command_name, @args )
-		  unless ( $app->get_interactivity_mode
-			&& !$app->is_interactive_command($command_name) );
-	}
-
-	my $application_usage = $app->usage;
-
-	# Remove usage of invalid/noninteractive commands from application help
-	for ( $app->noninteractive_commands ) {
-		$application_usage =~ s/\n\s+$_\s+\-[^\n]+//
-		  if (
-			(
-				$_ =~ /^(search|compare|history)$/
-				&& !$app->is_interactive_command($_)
-			)
-			|| ( $_ =~ /^(menu|console)$/ && $app->get_interactivity_mode )
-		  );
-
-	}
-
-	# Fall back to application usage message
-	$usage ||= $application_usage;
-	return $usage;
+ # Fall back to application usage message
+ $usage ||= $app_usage;
+ return $usage;
 }
 
 #-------
 1;
-
 __END__
 
 =pod

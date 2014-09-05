@@ -77,5 +77,15 @@ Revision history for CohortExplorer
         - Fixed bug in REDCap datasource API:
           variable_count in describe command does not show count of unique variables
   
-        - Documentation corrections 
- 
+        - Documentation corrections  
+
+0.14   2014-09-05
+        
+        - Support for OpenClinica is added (OpenClinica datasource API)
+
+        - Fixed bug in ordering of visits/events and variable de-identification in REDCap datasource API
+
+        - Multiple arms datasources in REDCap can now be queried by creating two separate configurations
+          (one for each arm) in datasource-config.properties
+          
+        - When running the search/compare commands the metadata can also be exported with the data

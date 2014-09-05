@@ -3,86 +3,71 @@ package CohortExplorer::Command::History;
 use strict;
 use warnings;
 
-our $VERSION = 0.13;
+our $VERSION = 0.14;
 
 use base qw(CLI::Framework::Command);
 use CLI::Framework::Exceptions qw( :all );
 use CohortExplorer::Command::Query qw($COMMAND_HISTORY);
 
 #-------
-
 sub usage_text {
-
-	       q{
-           history [--show|s] [--clear|c] : show saved commands
-         };
+ q{
+    history [--show|s] [--clear|c] : show saved commands
+  };
 }
 
 sub option_spec {
-
-	(
-		[],
-		[ 'show|s'  => 'show command history' ],
-		[ 'clear|c' => 'clear command history' ], 
-		[]
-	);
+ (
+   [],
+   [ 'show|s'  => 'show command history' ],
+   [ 'clear|c' => 'clear command history' ], 
+   []
+ );
 }
 
 sub validate {
-
-	my ( $self, $opts, @args ) = @_;
-
-	if (@args) {
-		throw_cmd_validation_exception(
-			error => "Specified arguments when none required" );
-	}
-
-	if ( $opts->{show} && $opts->{clear} ) {
-		throw_cmd_validation_exception( error =>
-			  "Specified mutually exclusive options (show and clear) together"
-		);
-	}
+ my ( $self, $opts, @args ) = @_;
+ if (@args) {
+  throw_cmd_validation_exception(
+                     error => 'No arguments are required to run this command' );
+ }
+ if ( $opts->{show} && $opts->{clear} ) {
+  throw_cmd_validation_exception( error =>
+         'Mutually exclusive options (show and clear) are specified together' );
+ }
 }
 
 sub run {
+ my ( $self, $opts, @args ) = @_;
+ my ( $ds_name, $verbose ) = @{ $self->cache->get('cache') }{qw/datasource_name verbose/};
+ my @saved_commands = sort { $a <=> $b } keys %{ $COMMAND_HISTORY->{datasource}{$ds_name} };
 
-	my ( $self, $opts, @args ) = @_;
-	my $alias = $self->cache->get('cache')->{datasource}->alias;
-	my @saved_commands =
-	  sort { $a <=> $b } keys %{ $COMMAND_HISTORY->{datasource}{$alias} };
+ # Show all saved commands for the current datasource along with datetime
+ if ( $opts->{show} && @saved_commands ) {
+  push my @rows, [qw/command_no datetime command/];
+  for (@saved_commands) {
+   push @rows,
+     [
+       $_,
+       @{ $COMMAND_HISTORY->{datasource}{$ds_name}{$_} }{qw/datetime command/}
+     ];
+  }
+  
+  print STDERR "\nRendering command history ...\n\n" if $verbose;
+  
+  return {
+           headingText => 'command history',
+           rows        => \@rows
+  };
+ }
 
-	# Shows all saved commands for the current datasource along with datetime
-	if ( $opts->{show} && @saved_commands ) {
-		push my @rows, [qw/command_no datetime command/];
-		for (@saved_commands) {
-			push @rows,
-			  [
-				$_,
-				@{ $COMMAND_HISTORY->{datasource}{$alias}{$_} }
-				  {qw/datetime command/}
-			  ];
-
-		}
-
-		print STDERR "\nRendering command history ...\n\n"
-		  if ( $self->cache->get('cache')->{verbose} );
-
-		return {
-			headingText => 'command history',
-			rows        => \@rows
-		};
-	}
-
-	# Clears the command history for the current datasource
-	delete $COMMAND_HISTORY->{datasource}{$alias} if ( $opts->{clear} );
-
-	return undef;
-
+ # Clears the command history for the current datasource
+ delete $COMMAND_HISTORY->{datasource}{$ds_name} if $opts->{clear};
+ return;
 }
 
 #-------
 1;
-
 __END__
 
 =pod

@@ -7,7 +7,16 @@ use 5.006;
 use strict;
 use warnings;
 
-our $VERSION = 0.13;
+our $VERSION = 0.14;
+
+use CohortExplorer::Application;
+
+# Untaint arguments
+for ( 0 .. $#ARGV ) {
+ if ( $ARGV[$_] =~ /^(.*)$/ ) {
+  $ARGV[$_] = $1;
+ }
+}
 
 #-------
 
@@ -25,7 +34,7 @@ B<CohortExplorer [OPTIONS] COMMAND [COMMAND-OPTIONS]>
 
 =head1 DESCRIPTION
 
-CohortExplorer provides an abstracted command line search interface for querying data and meta data stored in clinical data repositories implemented using the Entity-Attribute-Value (EAV) schema also known as the generic schema. Most of the available electronic data capture and clinical data management systems such as L<LabKey|https://labkey.com/>, L<OpenClinica|https://www.openclinica.com/>, L<REDCap|http://project-redcap.org/>, L<Onyx|http://obiba.org/node/3>, L<Opal|http://obiba.org/node/63> and L<i2b2|https://www.i2b2.org/> use EAV schema as it allows the organisation of heterogeneous data with relatively simple schema. With CohortExplorer's abstracted framework it is possible to 'plug-n-play' with clinical data repositories using the L<datasource API|CohortExplorer::Datasource>. The datasources stored in Opal and REDCap can be queried using the in-built APIs (see L<here|http://www.youtube.com/watch?v=Tba9An9cWDY>).
+CohortExplorer provides an abstracted command line search interface for querying data and meta data stored in clinical data repositories implemented using the Entity-Attribute-Value (EAV) schema also known as the generic schema. Most of the available electronic data capture and clinical data management systems such as L<LabKey|https://labkey.com/>, L<OpenClinica|https://www.openclinica.com/>, L<REDCap|http://project-redcap.org/>, L<Onyx|http://obiba.org/node/3> and L<Opal|http://obiba.org/node/63> use EAV schema as it allows the organisation of heterogeneous data with relatively simple schema. With CohortExplorer's abstracted framework it is possible to 'plug-n-play' with clinical data repositories using the L<datasource API|CohortExplorer::Datasource>. The datasources stored in Opal, REDCap and OpenClinica can be queried using the built-in APIs (see L<here|http://www.youtube.com/watch?v=Tba9An9cWDY>).
 
 The application makes use of the following concepts to explore clinical data repositories using the EAV schema:
 
@@ -189,7 +198,7 @@ disabling the access to configuration files and log file to users other than the
 
 =head1 BUGS 
 
-Currently the application does not support the querying of datasources with multiple arms. The application is only tested with clinical data repositories implemented in MySQL and is yet to be tested with repositories implemented in Oracle, PostgreSQL and Microsoft SQL Server. Please report any bugs or feature requests to adixit@cpan.org.
+Currently the application does not support the querying of datasources with multiple arms. The application is only tested with clinical data repositories implemented in MySQL and is yet to be tested with repositories implemented in Oracle and Microsoft SQL Server. Please report any bugs or feature requests to adixit@cpan.org.
 
 =head1 DEPENDENCIES
 

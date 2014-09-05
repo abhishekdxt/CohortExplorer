@@ -27,6 +27,7 @@ requires:
   File::HomeDir: 0.98
   File::Spec: 0
   FileHandle: 0
+  HTTP::Cookies: 6.00
   JSON : 2.53
   LWP::UserAgent: 6.03
   Log::Log4perl: 1.29
@@ -44,4 +45,4 @@ requires:
   perl: 5.010
 resources:
    license: http://dev.perl.org/licenses/
-version: 0.13
+version: 0.14

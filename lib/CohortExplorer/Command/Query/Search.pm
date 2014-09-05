@@ -3,321 +3,271 @@ package CohortExplorer::Command::Query::Search;
 use strict;
 use warnings;
 
-our $VERSION = 0.13;
+our $VERSION = 0.14;
 
 use base qw(CohortExplorer::Command::Query);
 use CLI::Framework::Exceptions qw( :all );
 
 #-------
-
 # Command is available to both standard and longitudinal datasources
 sub usage_text {
-
-	q\
-              search [--out|o=<directory>] [--export|e=<table>] [--export-all|a] [--save-command|s] [--stats|S] [--cond|c=<cond>] 
-              [variable] : search entities with/without conditions on variables
+ q\
+     search [--out|o=<directory>] [--export|e=<table>] [--export-all|a] [--save-command|s] [--stats|S] [--cond|c=<cond>] 
+            [variable] : search entities with/without conditions on variables
               
               
-              NOTES
-                 The variables entity_id and visit (if applicable) must not be provided as arguments as they are already part of
-                 the query-set. However, the user can impose conditions on both variables.
+     NOTES
+         The variables entity_id and visit (if applicable) must not be provided as arguments as they are already part of
+         the query-set. However, the user can impose conditions on both variables.
 
-                 Other variables in arguments/cond (option) must be referenced as <table>.<variable>.
+         Other variables in arguments/cond (option) must be referenced as <table>.<variable>.
 
-                 The conditions can be imposed using the operators such as =, !=, >, <, >=, <=, between, not_between, like, not_like, 
-                 in, not_in, regexp and not_regexp. The keyword undef can be used to search for null values.
+         The conditions can be imposed using the operators such as =, !=, >, <, >=, <=, between, not_between, like, 
+         not_like, ilike, in, not_in, regexp and not_regexp. 
 
-                 The directory specified in 'out' option must have RWX enabled (i.e. chmod 777) for CohortExplorer.
+         The keyword undef can be used to search for null values.
+
+         The directory specified in 'out' option must have RWX enabled (i.e. chmod 777) for CohortExplorer.
 
 
-              EXAMPLES
-                 search --out=/home/user/exports --stats --save-command --cond=DS.Status='=, CTL, MCI' GDS.Score
+     EXAMPLES
+         search --out=/home/user/exports --stats --save-command --cond=DS.Status='=, CTL, MCI' GDS.Score
                  
-                 search --out=/home/user/exports --stats --save-command --cond=CER.Score='<=, 30' GDS.Score
+         search --out=/home/user/exports --stats --save-command --cond=CER.Score='<=, 30' GDS.Score
 
-                 search --out=/home/user/exports --export-all --cond=SD.Sex='=, Male' CER.Score DIS.Status
+         search --out=/home/user/exports --export-all --cond=SD.Sex='=, Male' CER.Score DIS.Status
 
-                 search -o/home/user/exports -eDS -eSD -c entity_id='like, DCR%' DIS.Status
+         search -o/home/user/exports -eDS -eSD -c entity_id='like, DCR%' DIS.Status
 
-                 search -o/home/user/exports -Ssa -c visit='in, 1, 3, 5' DIS.Status 
+         search -o/home/user/exports -Ssa -c visit='in, 1, 3, 5' DIS.Status 
 
-                 search -o/home/user/exports -c CER.Score='between, 25, 30' DIS.Status
+         search -o/home/user/exports -c CER.Score='between, 25, 30' DIS.Status
  \;
 }
 
 sub get_valid_variables {
-
-	my ($self) = @_;
-
-	my $ds = $self->cache->get('cache')->{datasource};
-
-	my @var = keys %{ $ds->variables };
-
-	return $ds->type eq 'standard'
-	  ? [ qw/entity_id/, @var ]
-	  : [ qw/entity_id visit/, @var ];
-
+ my ($self) = @_;
+ my $ds     = $self->cache->get('cache')->{datasource};
+ my @vars   = keys %{ $ds->variable_info };
+ return $ds->type eq 'standard'
+   ? [ qw/entity_id/, @vars ]
+   : [ qw/entity_id visit/, @vars ];
 }
 
 sub create_query_params {
+ my ( $self, $opts, @args ) = @_;
+ my ( $ds, $csv ) = @{ $self->cache->get('cache') }{qw/datasource csv/};
+ my $dialect = $ds->dialect;
+ my $struct  = $ds->entity_structure;
+ my %map     = @{ $struct->{-columns} };
+ my $aliase_in_having = $dialect->aliase_in_having || undef;
 
-	my ( $self, $opts, @args ) = @_;
-	my $ds           = $self->cache->get('cache')->{datasource};
-	my $ds_type      = $ds->type;
-	my $variables    = $ds->variables;
-	my @static_table = @{ $ds->static_tables || [] };
-	my $dbh          = $ds->dbh;
-	my $csv          = $self->cache->get('cache')->{csv};
-	my $struct       = $ds->entity_structure;
-	$struct->{-columns} = $ds->entity_columns;
+ my ( @vars, %param );
 
-	my @condition_var =
-	  grep ( !/^(entity_id|visit)$/, keys %{ $opts->{cond} } );
+ # Extract all variables from args/cond (option) except
+ # entity_id and visit as they are dealt separately
+ for my $v ( @args, keys %{ $opts->{cond} } ) {
+  if ( !grep ( $_ eq $v, ( 'entity_id', 'visit', @vars ) ) ) {
+   push @vars, $v;
+  }
+ }
 
-	my %param;
+ for (@vars) {
+  ##---- BUILD 'WHERE' FOR TABLES AND VARIABLES ----##
+  my ( $t, $v ) = @{ $ds->variable_info->{$_} }{qw/table variable/};
+  my $table_type = $ds->table_info->{$t}{__type__};
+  
+  push @{ $param{$table_type}{-where}{ $map{table} }{-in} },    $t;
+  push @{ $param{$table_type}{-where}{ $map{variable} }{-in} }, $v;
+  
+  my $col_sql = 'CAST( NULLIF( '
+    . $dialect->aggregate(
+        (
+         (
+           $table_type eq 'static' ? 'DISTINCT' : ''
+         )
+         . " CASE WHEN CONCAT($map{table}, '.', $map{variable} )  = '$_' THEN TRIM( $map{value} ) ELSE NULL END "
+        )
+    )
+    . ", '' ) AS "
+    . $ds->variable_info->{$_}{__type__} . ' )';
 
-	require Tie::IxHash;
+  push @{ $param{$table_type}{-columns} }, $_ => $col_sql;
+  
+  # Take into account the dialect's support for the use of aliases in 'having' clause
+  # Postgresql does not allow the use of column names but mysql does making the query more 
+  # readable and easy to understand/debug 
+  my $alias = $aliase_in_having ? "`$_`" : $col_sql;
+  
+  ##---- BUILD 'HAVING' FOR CONDITIONS ON VARIABLES ----##
+  if (    $opts->{cond}
+       && $opts->{cond}{$_}
+       && $csv->parse( $opts->{cond}{$_} ) )
+  {
+   my ( $opr, @conds ) = grep ( s/^\s*|\s*$//g, $csv->fields );
+   $param{$table_type}{-having}{$alias} = { ( $dialect->$opr || $opr ) =>  \@conds };
+  }
+ }
+ 
+ ##---- ADD IDENTIFIER, VISIT AND GROUP BY COLUMNS ----##
+ for ( keys %param ) {
+  if ( $_ eq 'static' ) {
+   $param{$_}{-group_by} = 'entity_id';
+  }
+  else {
+   $param{$_}{-group_by} = [qw/entity_id visit/];
+   unshift @{ $param{$_}{-columns} }, visit => $map{visit};
+   my $alias = $aliase_in_having ? 'visit' : $map{visit};
+   # Set condition on visit
+   if (    $opts->{cond}
+        && $opts->{cond}{visit}
+        && $csv->parse( $opts->{cond}{visit} ) )
+   {
+    my ( $opr, @conds ) = grep ( s/^\s*|\s*$//g, $csv->fields );
+    $param{$_}{-having}{$alias} = { ( $dialect->$opr || $opr ) =>  \@conds };
+   }
+  }
+  
+  ###--- PARAMETERS COMMON TO BOTH STATIC AND DYNAMIC TABLE TYPES ---###
+  unshift @{ $param{$_}{-columns} }, entity_id => $map{entity_id};
+  
+  if ( $opts->{cond} && $opts->{cond}{entity_id} ) {
+   # Set condition on entity_id
+   my $alias = $aliase_in_having ? 'entity_id' : $map{entity_id};
+   my ( $opr, @conds ) = split /\s*,\s*/, $opts->{cond}{entity_id};
+   $param{$_}{-having}{$alias} = { ( $dialect->$opr || $opr ) =>  \@conds };
+  }
+  
+  $param{$_}{-from} = $struct->{-from};
+  $param{$_}{-where} =
+    $struct->{-where}
+    ? { %{ $param{$_}{-where} }, %{ $struct->{-where} } }
+    : $param{$_}{-where};
 
-	tie my %args, 'Tie::IxHash', map { $_ => 1 } @args;
-
-	my @var = ( keys %args, grep { !$args{$_} } @condition_var );
-
-	for (@var) {
-		/^([^\.]+)\.(.+)$/;
-
-     # Extract tables and variable names, a variable is referenced as <table>.<variable>
-		my $table_type =
-		  $ds_type eq 'standard'
-		  ? 'static'
-		  : ( grep ( $_ eq $1, @static_table ) ? 'static' : 'dynamic' );
-
-  # Build a hash with keys 'static' and 'dynamic'.
-  # Each key contains its own SQL parameters
-  # In static tables rows are grouped on entity_id where as in dynamic tables
-  # (i.e. longitudinal datasources) the rows are grouped on entity_id and visit
-		push
-		  @{ $param{$table_type}{-where}{ $struct->{-columns}{table} }{-in} },
-		  $1;
-		push @{ $param{$table_type}{-where}{ $struct->{-columns}{variable} }
-			  {-in} }, $2;
-
-		push @{ $param{$table_type}{-columns} },
-		    " CAST( GROUP_CONCAT( "
-		  . ( $table_type eq 'static' ? 'DISTINCT' : '' )
-		  . (
-                      " IF( CONCAT( $struct->{-columns}{table}, '.', $struct->{-columns}{variable} ) = '$_', $struct->{-columns}{value}, NULL ) ) AS "
-		  )
-		  . ( uc $variables->{$_}{type} )
-		  . " ) AS `$_`";
-
-		if (   $opts->{cond}
-			&& $opts->{cond}{$_}
-			&& $csv->parse( $opts->{cond}{$_} ) )
-		{
-
-			# Split the condition on comma
-			# First element is operator followed by value
-			my @cond = grep ( s/^\s*|\s*$//g, $csv->fields );
-			$param{$table_type}{-having}{"`$_`"} =
-			  { $cond[0] => [ @cond[ 1 .. $#cond ] ] };
-		}
-	}
-
-	for ( keys %param ) {
-
-		if ( $_ eq 'static' ) {
-			unshift @{ $param{$_}{-columns} },
-			  $struct->{-columns}{entity_id} . ' AS `entity_id`';
-			$param{$_}{-group_by} = 'entity_id';
-		}
-
-		else {
-
-		 # entity_id and visit are added to the list of SQL cols in dynamic param
-			unshift @{ $param{$_}{-columns} },
-			  (
-				$struct->{-columns}{entity_id} . ' AS `entity_id`',
-				' (' . $struct->{-columns}{visit} . ' + 0 ) AS `visit`'
-			  );
-
-			$param{$_}{-group_by} = [qw/entity_id visit/];
-
-			if (   $opts->{cond}
-				&& $opts->{cond}{visit}
-				&& $csv->parse( $opts->{cond}{visit} ) )
-			{
-
-				# Set condition on visit
-				my @cond = grep ( s/^\s*|\s*$//g, $csv->fields );
-				$param{$_}{-having}{visit} =
-				  { $cond[0] => [ @cond[ 1 .. $#cond ] ] };
-			}
-		}
-
-		$param{$_}{-from} = $struct->{-from};
-
-		$param{$_}{-where} =
-		  $struct->{-where}
-		  ? { %{ $param{$_}{-where} }, %{ $struct->{-where} } }
-		  : $param{$_}{-where};
-
-		if ( $opts->{cond} && $opts->{cond}{entity_id} ) {
-
-			# Set condition on entity_id
-			my @cond = split /\s*,\s*/, $opts->{cond}{entity_id};
-			$param{$_}{-having}{entity_id} =
-			  { $cond[0] => [ @cond[ 1 .. $#cond ] ] };
-		}
-
-		$param{$_}{-order_by} = 'entity_id + 0';
-
-		# Make sure condition clause in 'tables' has no duplicate placeholders
-		$param{$_}{-where}{ $struct->{-columns}{table} }{-in} = [
-			keys %{
-				{
-					map { $_ => 1 }
-					  @{ $param{$_}{-where}{ $struct->{-columns}{table} }{-in} }
-				}
-			  }
-		];
-
-	}
-
-	return \%param;
-
+  # Make sure condition clause in 'tables' has no duplicate placeholders
+  $param{$_}{-where}{ $map{table} }{-in} = [
+    keys %{ { map { $_ => 1 } @{ $param{$_}{-where}{ $map{table} }{-in} } } } ];
+ }
+   
+   return \%param;
 }
 
 sub process_result {
+ my ( $self, $opts, $rs, $dir, @args ) = @_;
+ my $csv = $self->cache->get('cache')->{csv};
+ my %rs_entity;
 
-	my ( $self, $opts, $rs, $dir, @args ) = @_;
+ # Write result set
+ my $file = File::Spec->catfile( $dir, 'QueryOutput.csv' );
+ my $fh = FileHandle->new("> $file") 
+   or throw_cmd_run_exception( error => "Failed to open file: $!" );
 
-	my %rs_entity;
-
-	# Write result set
-	my $file = File::Spec->catfile( $dir, "QueryOutput.csv" );
-
-	my $fh = FileHandle->new("> $file")
-	  or throw_cmd_run_exception( error => "Failed to open file: $!" );
-
-	my $csv = $self->cache->get('cache')->{csv};
-
-	# Returns a ref to hash with key as entity_id and value either:
-	# list of visit numbers if the result-set contains visit column
-	# (i.e. dynamic tables- Longitudinal datasources) or,
-	# empty list (i.e. static tables)
-	for ( 0 .. $#$rs ) {
-		if ( $_ > 0 ) {
-			push @{ $rs_entity{ $rs->[$_][0] } },
-			  $rs->[0][1] eq 'visit' ? $rs->[$_][1] : ();
-		}
-
-		$csv->print( $fh, $rs->[$_] )
-		  or throw_cmd_run_exception( error => $csv->error_diag );
-	}
-
-	$fh->close;
-
-	return \%rs_entity;
-
+ # Returns a ref to hash with key as entity_id and value either:
+ # list of visit numbers if the result-set contains visit column
+ # (i.e. dynamic tables- Longitudinal datasources) or,
+ # empty list (i.e. static tables)
+ for ( 0 .. $#$rs ) {
+  if ( $_ > 0 ) {
+   if ( $rs->[0][1] eq 'visit' ) {
+    push @{ $rs_entity{ $rs->[$_][0] } }, $rs->[$_][1];
+   }
+   else {
+    push @{ $rs_entity{ $rs->[$_][0] } }, ();
+   }
+  }
+  $csv->print( $fh, $rs->[$_] )
+    or throw_cmd_run_exception( error => $csv->error_diag );
+ }
+ 
+ $fh->close;
+ return \%rs_entity;
 }
 
 sub process_table {
+ my ( $self, $table, $ts, $dir, $rs_entity ) = @_;
+ my ( $ds, $csv ) = @{ $self->cache->get('cache') }{qw/datasource csv/};
+ my $table_info = $ds->table_info;
+ my $var_info   = $ds->variable_info;
+ my ( @vars, %data );
+ 
+ for ( keys %$var_info ) {
+  if ( $var_info->{$_}{table} eq $table ) {
+       push @vars, $var_info->{$_}{variable};
+  }
+ }
+ 
+ for (@$ts) {
+  if ( $table_info->{$table}{__type__} eq 'static' ) {
+         $data{ $_->[0] }{ $_->[1] } = $_->[2];
+  }
+  else {
+         $data{ $_->[0] }{ $_->[3] }{ $_->[1] } = $_->[2];
+  }
+ }
 
-	my ( $self, $table, $ts, $dir, $rs_entity ) = @_;
+ # Add visit column to the header if the table is dynamic
+ my $file = File::Spec->catfile( $dir, 'data.csv' );
+ my $untaint = $1 if ( $file =~ /^(.+)$/ );
+ my $fh = FileHandle->new("> $untaint")
+   or throw_cmd_run_exception( error => "Failed to open file: $!" );
+   
+ my @cols =
+   $table_info->{$table}{__type__} eq 'static'
+   ? ( qw/entity_id/, @vars )
+   : ( qw/entity_id visit/, @vars );
+ 
+ $csv->print( $fh, \@cols )
+   or throw_cmd_run_exception( error => $csv->error_diag );
+ 
+ my @sorted_entity =
+   DBI::looks_like_number( ( keys %$rs_entity )[-1] )
+   ? sort { $a <=> $b } keys %$rs_entity
+   : sort { $a cmp $b } keys %$rs_entity;
 
-	my ( $ds, $csv ) = @{ $self->cache->get('cache') }{qw/datasource csv/};
-
-	my @static_table = @{ $ds->static_tables || [] };
-
-	my $table_type =
-	  $ds->type eq 'standard'
-	  ? 'static'
-	  : ( grep ( $_ eq $table, @static_table ) ? 'static' : 'dynamic' );
-
-	# Get table header
-	my @var = map { /^$table\.(.+)$/ ? $1 : () } keys %{ $ds->variables };
-
-	my %data;
-
-	for (@$ts) {
-
-		if ( $table_type eq 'static' ) {
-			$data{ $_->[0] }{ $_->[1] } = $_->[2];
-		}
-		else {
-			$data{ $_->[0] }{ $_->[3] }{ $_->[1] } = $_->[2];
-		}
-	}
-
-	# Add visit column to the header if the table is dynamic
-	my $file = File::Spec->catfile( $dir, "$table.csv" );
-
-	my $untainted = $1 if ( $file =~ /^(.+)$/ );
-
-	my $fh = FileHandle->new("> $untainted")
-	  or throw_cmd_run_exception( error => "Failed to open file: $!" );
-
-	my @column =
-	  $table_type eq 'static'
-	  ? ( qw(entity_id), @var )
-	  : ( qw(entity_id visit), @var );
-
-	$csv->print( $fh, \@column )
-	  or throw_cmd_run_exception( error => $csv->error_diag );
-
-	my @sorted_entity =
-	  ( keys %$rs_entity )[-1] =~ /^[0-9]+$/
-	  ? sort { $a <=> $b } keys %$rs_entity
-	  : sort { $a cmp $b } keys %$rs_entity;
-
-	# Write data for entities present in the result set
-	for my $entity (@sorted_entity) {
-		if ( $table_type eq 'static' ) {
-			my @val = ( $entity, map { $data{$entity}{$_} } @var );
-			$csv->print( $fh, \@val )
-			  or throw_cmd_run_exception( error => $csv->error_diag );
-		}
-		else {    # dynamic tables
-			for my $visit (
-				  @{ $rs_entity->{$entity} }
-				? @{ $rs_entity->{$entity} }
-				: keys %{ $data{$entity} }
-			  )
-			{
-				my @val =
-				  ( $entity, $visit, map { $data{$entity}{$visit}{$_} } @var );
-
-				$csv->print( $fh, \@val )
-				  or throw_cmd_run_exception( error => $csv->error_diag );
-			}
-		}
-	}
-
-	$fh->close;
+ # Write data for entities present in the result set
+ for my $entity (@sorted_entity) {
+  if ( $table_info->{$table}{__type__} eq 'static' ) {
+   my @vals = ( $entity, map { $data{$entity}{$_} } @vars );
+   $csv->print( $fh, \@vals )
+     or throw_cmd_run_exception( error => $csv->error_diag );
+  }
+  else {
+   for my $visit (
+                     @{ $rs_entity->{$entity} }
+                   ? @{ $rs_entity->{$entity} }
+                   : keys %{ $data{$entity} }
+     )
+   {
+    my @vals = ( $entity, $visit, map { $data{$entity}{$visit}{$_} } @vars );
+    $csv->print( $fh, \@vals )
+      or throw_cmd_run_exception( error => $csv->error_diag );
+   }
+  }
+ }
+ 
+ $fh->close;
 }
 
 sub create_dataset {
+ my ( $self, $rs ) = @_;
 
-	my ( $self, $rs ) = @_;
+ # If the result set contains visit column group data
+ # by visit (i.e. dynamic tables/longitudinal datasources)
+ my $index = $rs->[0][1] eq 'visit' ? 1 : 0;
+ my %data;
+ 
+ for my $r ( 1 .. $#$rs ) {
+  my $key = $index == 0 ? 1 : $rs->[$r][$index];
+  for ( $index + 1 .. $#{ $rs->[0] } ) {
+   push @{ $data{$key}{ $rs->[0][$_] } }, $rs->[$r][$_] || ();
+  }
+ }
 
-	# If the result set contains visit column group data
-	# by visit (i.e. dynamic tables/longitudinal datasources)
-	my $index = $rs->[0][1] eq 'visit' ? 1 : 0;
-	my %data;
-
-	for my $r ( 1 .. $#$rs ) {
-		my $key = $index == 0 ? 1 : $rs->[$r][$index];
-		for ( $index + 1 .. $#{ $rs->[0] } ) {
-			push @{ $data{$key}{ $rs->[0][$_] } }, $rs->[$r][$_] || ();
-		}
-	}
-
-	return ( \%data, $index, splice @{ $rs->[0] }, 1 );
+ return ( \%data, $index, splice @{ $rs->[0] }, 1 );
 }
 
 #-------
 1;
-
 __END__
 
 =pod
@@ -388,7 +338,7 @@ Show summary statistics
 
 =item B<-c> I<COND>, B<--cond>=I<COND>
             
-Impose conditions using the operators: C<=>, C<!=>, C<E<gt>>, C<E<lt>>, C<E<gt>=>, C<E<lt>=>, C<between>, C<not_between>, C<like>, C<not_like>, C<in>, C<not_in>, C<regexp> and C<not_regexp>.
+Impose conditions using the operators: C<=>, C<!=>, C<E<gt>>, C<E<lt>>, C<E<gt>=>, C<E<lt>=>, C<between>, C<not_between>, C<like>, C<not_like>, C<ilike>, C<in>, C<not_in>, C<regexp> and C<not_regexp>.
 
 =back
 

@@ -3,75 +3,58 @@ package CohortExplorer::Command::Describe;
 use strict;
 use warnings;
 
-our $VERSION = 0.13;
+our $VERSION = 0.14;
 
 use base qw(CLI::Framework::Command);
 use CLI::Framework::Exceptions qw( :all );
+use Exception::Class::TryCatch;
 
 #-------
-
 sub usage_text {
-
-	        q{
-            describe : show datasource description including the entity count 
-          };
-
+ q{
+      describe : show datasource description including the entity count 
+  };
 }
 
 sub validate {
-
-	my ( $self, $opts, @args ) = @_;
-
-	if (@args) {
-		throw_cmd_validation_exception(
-			error => 'Specified arguments when none required' );
-	}
-
+ my ( $self, $opts, @args ) = @_;
+ 
+ if (@args) {
+  throw_cmd_validation_exception(
+                     error => 'No arguments are required to run this command' );
+ }
 }
 
 sub run {
+ my ( $self, $opts, @args ) = @_;
+ my ( $ds, $verbose ) = @{ $self->cache->get('cache') }{qw/datasource verbose/};
+ my ( @cols, @rows );
+ my $table_info = $ds->table_info;
 
-	my ( $self, $opts, @args ) = @_;
-
-	my $cache = $self->cache->get('cache');
-
-	# May or may not be preloaded
-	eval 'require ' . ref $cache->{datasource};
-
-	my $tables = $cache->{datasource}->tables;
-
-	# Get all table attributes using the last key in $tables
-	# The first column is always table name
-	push my @column, 'table';
-
-	for ( keys %{ $tables->{ ( keys %$tables )[-1] } } ) {
-		if ( $_ ne 'table' ) {
-			push @column, $_;
-		}
-	}
-
-	push my @rows, \@column;
-
-	for my $t ( keys %$tables ) {
-		push @rows,
-		  [ map { $tables->{$t}{ $rows[0]->[$_] } } 0 .. $#{ $rows[0] } ];
-	}
-
-	print STDERR "\nRendering datasource description ...\n\n"
-	  if ( $cache->{verbose} );
-
-	return {
-		headingText => $cache->{datasource}->name
-		  . ' datasource description ('
-		  . $cache->{datasource}->entity_count
-		  . ' entities)',
-		rows => \@rows
-	};
+# Get all table attributes using the last key in $tables, first column is always table name
+ push @cols, 'table';
+ for ( keys %{ $table_info->{ ( keys %$table_info )[-1] } } ) {
+  if ( $_ ne 'table' && $_ ne '__type__' ) {
+   push @cols, $_;
+  }
+ }
+ push @rows, \@cols;
+ for my $t ( keys %$table_info ) {
+  push @rows, [ map { $table_info->{$t}{$_} } @cols ];
+ }
+ 
+ print STDERR "\nRendering datasource description ...\n\n" if $verbose;
+ return {
+          headingText => $ds->name
+            . ' datasource description ('
+            . $ds->entity_count
+            . ' entities)',
+          rows => \@rows
+ };
 }
 
 #-------
 1;
-
 __END__
 
 =pod

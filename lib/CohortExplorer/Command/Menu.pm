@@ -3,39 +3,33 @@ package CohortExplorer::Command::Menu;
 use strict;
 use warnings;
 
-our $VERSION = 0.13;
+our $VERSION = 0.14;
 
 use base qw( CLI::Framework::Command::Menu );
 
 #-------
-
 sub menu_txt {
+ my ($self) = @_;
+ my $app = $self->get_app;
+ my ( @cmd, $txt );
 
-	my ($self) = @_;
+ # Get all valid commands
+ for my $c ( $app->get_interactive_commands ) {
+  if ( grep ( $_ ne $c, $app->noninteractive_commands ) ) {
+   push @cmd, $c;
+  }
+ }
+ my %aliases = reverse $app->command_alias;
 
-	my $app = $self->get_app;
-
-	my ( @cmd, $txt );
-
-	# Get all valid commands
-	for my $c ( $app->get_interactive_commands ) {
-		if ( grep ( $_ ne $c, $app->noninteractive_commands ) ) {
-			push @cmd, $c;
-		}
-	}
-
-	my %aliases = reverse $app->command_alias;
-
-	# Create menu txt which contains all valid commands with their aliases
-	for (@cmd) {
-		$txt .= sprintf( "%-5s%2s%10s\n", $aliases{$_}, '-', $_ );
-	}
-	return "\n\n" . $txt . "\n\n";
+ # Create menu txt which contains all valid commands with their aliases
+ for (@cmd) {
+  $txt .= sprintf( "%-5s%2s%10s\n", $aliases{$_}, '-', $_ );
+ }
+ return "\n\n" . $txt . "\n\n";
 }
 
 #-------
 1;
-
 __END__
 
 =pod

@@ -3,486 +3,439 @@ package CohortExplorer::Command::Query::Compare;
 use strict;
 use warnings;
 
-our $VERSION = 0.13;
+our $VERSION = 0.14;
 
 use base qw(CohortExplorer::Command::Query);
 use CLI::Framework::Exceptions qw( :all );
 
 #-------
-
 # Command is only available to longitudinal datasources
 sub usage_text {
-
-	q\
-                compare [--out|o=<directory>] [--export|e=<table>] [--export-all|a] [--save-command|s] [--stats|S] [--cond|c=<cond>]
-                [variable] : compare entities across visits with/without conditions on variables
-
-
-                NOTES
-                   The variables entity_id and visit (if applicable) must not be provided as arguments as they are already part of the
-                   query-set. However, the user can impose conditions on both variables.
-
-                   Other variables in arguments/cond (option) must be referenced as <table>.<variable> or <visit>.<table>.<variable> where
-                   visit can be vAny, vLast, v1, v2, v3 ... vMax. Here vMax is the maximum visit number for which data is available.
-
-                   Conditions can be imposed using the operators: =, !=, >, <, >=, <=, between, not_between, like, not_like, in, not_in, 
-                   regexp and not_regexp. The keyword undef can be used to specify null.
-
-                   When condition is imposed on variable with no prefix such as vAny, vLast, v1, v2 and v3 the command assumes the
-                   condition applies to all visits of the variable.
-
-                   The directory specified in 'out' option must have RWX enabled (i.e. chmod 777) for CohortExplorer.
+ q\
+     compare [--out|o=<directory>] [--export|e=<table>] [--export-all|a] [--save-command|s] [--stats|S] [--cond|c=<cond>]
+             [variable] : compare entities across visits with/without conditions on variables
 
 
-                EXAMPLES
-                   compare --out=/home/user/exports --stats --save-command --cond=v1.CER.Score='>, 20' v1.SC.Date
+     NOTES
+       The variables entity_id and visit (if applicable) must not be provided as arguments as they are already part of the
+       query-set. However, the user can impose conditions on both variables.
 
-                   compare --out=/home/user/exports --export=CER --cond=SD.Sex='=, Male' v1.CER.Score v3.DIS.Status
+       Other variables in arguments/cond (option) must be referenced as <table>.<variable> or <visit>.<table>.<variable>
+       where visit can be vAny, vLast, v1, v2, v3 ... vMax. Here vMax is the maximum visit number for which data is
+       available.
+
+       Conditions can be imposed using the operators: =, !=, >, <, >=, <=, between, not_between, like, not_like, ilike, in,
+       not_in, regexp and not_regexp. The keyword undef can be used to specify null.
+
+       When condition is imposed on variable with no prefix such as vAny, vLast, v1, v2 and v3 the command assumes the
+       condition applies to all visits of the variable.
+
+       The directory specified in 'out' option must have RWX enabled (i.e. chmod 777) for CohortExplorer.
+
+
+     EXAMPLES
+       compare --out=/home/user/exports --stats --save-command --cond=v1.CER.Score='>, 20' v1.SC.Date
+
+       compare --out=/home/user/exports --export=CER --cond=SD.Sex='=, Male' v1.CER.Score v3.DIS.Status
  
-                   compare --out=/home/user/exports --export=CER --cond=v2.CER.Score'!=, undef' vLast.DIS.Status
+       compare --out=/home/user/exports --export=CER --cond=v2.CER.Score'!=, undef' vLast.DIS.Status
 
-                   compare -o/home/user/exports -Ssa -c vLast.CER.Score='in, 25, 30, 40' DIS.Status 
+       compare -o/home/user/exports -Ssa -c vLast.CER.Score='in, 25, 30, 40' DIS.Status 
 
-                   compare -o/home/user/exports -eCER -eSD -c vLast.CER.Score='between, 25, 30' DIS.Status
+       compare -o/home/user/exports -eCER -eSD -c vLast.CER.Score='between, 25, 30' DIS.Status
 
-             \;
+    \;
 }
 
 sub get_valid_variables {
-
-	my ($self) = @_;
-
-	my $ds = $self->cache->get('cache')->{datasource};
-
-	return [ 'entity_id', keys %{ $ds->variables }, @{ $ds->visit_variables } ];
-
+ my ($self) = @_;
+ my $ds = $self->cache->get('cache')->{datasource};
+ return [ 'entity_id', keys %{ $ds->variable_info },
+          @{ $ds->visit_variables } ];
 }
 
 sub create_query_params {
+ my ( $self, $opts, @args ) = @_;
+ my ( $ds, $csv ) = @{ $self->cache->get('cache') }{qw/datasource csv/};
+ my $visit_info       = $ds->visit_info;
+ my $dialect          = $ds->dialect;
+ my $struct           = $ds->entity_structure;
+ my %map              = @{ $struct->{-columns} };
+ my $aliase_in_having = $dialect->aliase_in_having || undef;
+ my $visit = $dialect->aggregate( "DISTINCT $map{visit} " 
+                                 . ( $struct->{-order_by} ? " ORDER BY $struct->{-order_by} " : '' ), '@@' );
+ 
+ my ( @vars, %param );
+ # Extract all variables from args/cond (option) except
+ # entity_id and visit as they are dealt separately
+ my $visit_regex = join( '|', map { $visit_info->{$_}{name} } keys %$visit_info );
+ 
+ for my $v ( @args, keys %{ $opts->{cond} } ) {
+  $v =~ s/^(?:vLast|vAny|$visit_regex)\.//;
+  if ( !grep ( $_ eq $v, ( 'entity_id', 'visit', @vars ) ) ) {
+   push @vars, $v;
+  }
+ }
+ 
+ for my $var (@vars) {
+  ##---- BUILD 'WHERE' FOR TABLES AND VARIABLES ----##
+  my ( $t, $v ) = @{ $ds->variable_info->{$var} }{qw/table variable/};
+  my $table_type = $ds->table_info->{$t}{__type__};
+  
+  push @{ $param{$table_type}{-where}{ $map{table} }{-in} },    $t;
+  push @{ $param{$table_type}{-where}{ $map{variable} }{-in} }, $v;
+  
+  my $col_sql = 'CAST( NULLIF( '
+    . $dialect->aggregate(
+       (
+        ( $table_type eq 'static' ? 'DISTINCT' : '' )
+        . " CASE WHEN CONCAT( $map{table}, '.', $map{variable} ) " 
+        . (
+              $table_type eq 'static' ? " = '$var' " : " = '$var' AND $map{visit} = ? " )
+          . " THEN TRIM( $map{value} ) ELSE NULL END "
+       )
+    )
+    . ", '' ) AS "
+    . $ds->variable_info->{$var}{__type__} . ' )';
+  
+  if ( $table_type eq 'static' ) {
+   push @{ $param{$table_type}{-columns} }, $var => $col_sql;
+  }
+  
+  else {
+   # Each column corresponds to one visit variable
+   for my $i ( keys %$visit_info ) {
+    ( my $vv = $col_sql ) =~ s/\?/'$i'/;
+    push @{ $param{$table_type}{-columns} },
+      "$visit_info->{$i}{name}.$var" => $vv;
+   }
+  }
+  
+  ##---- BUILD 'HAVING' FOR CONDITIONS ON VARIABLES AND VISIT VARIABLES ----##
+  if ( $table_type eq 'static' ) {
+   if (    $opts->{cond}
+        && $opts->{cond}{$var}
+        && $csv->parse( $opts->{cond}{$var} ) )
+   {
 
-	my ( $self, $opts, @args ) = @_;
-	my $ds           = $self->cache->get('cache')->{datasource};
-	my $variables    = $ds->variables;
-	my @visit        = 1 .. $ds->visit_max;
-	my @static_table = @{ $ds->static_tables || [] };
-	my $dbh          = $ds->dbh;
-	my $csv          = $self->cache->get('cache')->{csv};
-	my $struct       = $ds->entity_structure;
-	$struct->{-columns} = $ds->entity_columns;
-	my %param;
+    # Set condition on static variable (i.e. variable from static table)
+    my ( $opr, @conds ) = grep ( s/^\s*|\s*$//g, $csv->fields );
+    my $alias = $aliase_in_having ? "`$var`" : $col_sql;
+    $param{$table_type}{-having}{$alias} =
+      {  ( $dialect->$opr || $opr ) => \@conds };
+   }
+  }
+  
+  else {
 
-	# Extract all variables from args/cond (option) except
-	# entity_id and visit as they are dealt separately
-	my @var = grep( !/^(entity_id|visit)$/,
-		keys %{
-			{
-				map { $_ => 1 } map { s/^v(Any|Last|[0-9]+)\.//; $_ } @args,
-				keys %{ $opts->{cond} }
-			}
-		  } );
-
-	for my $v (@var) {
-		$v =~ /^([^\.]+)\.(.+)$/;
-
-		# Extract tables and variable names
-		# Build a hash with keys: static and dynamic
-		# Each key contains its own sql parameters
-		my $table_type =
-		  grep ( $_ eq $1, @static_table ) ? 'static' : 'dynamic';
-
-		push
-		  @{ $param{$table_type}{-where}{ $struct->{-columns}{table} }{-in} },
-		  $1;
-		push @{ $param{$table_type}{-where}{ $struct->{-columns}{variable} }
-			  {-in} }, $2;
-
-		if ( $table_type eq 'dynamic' ) {
-
-			# Each column corresponds to one visit
-			for (@visit) {
-				push @{ $param{$table_type}{-columns} },
-                    " CAST( GROUP_CONCAT( IF( CONCAT( $struct->{-columns}{table}, '.', $struct->{-columns}{variable} ) = '$v'"
-				  . " AND $struct->{-columns}{visit} = $_, $struct->{-columns}{value}, NULL)) AS "
-				  . ( uc $variables->{$v}{type} )
-				  . " ) AS `v$_.$v`";
-			}
-		}
-		else {
-			push @{ $param{$table_type}{-columns} },
-			    " CAST( GROUP_CONCAT( DISTINCT "
-			  . " IF( CONCAT( $struct->{-columns}{table}, '.', $struct->{-columns}{variable} ) = '$v', $struct->{-columns}{value}, NULL)) AS "
-			  . ( uc $variables->{$v}{type} )
-			  . " ) AS `$v`";
-		}
-
-		if ( $table_type eq 'static' ) {
-			if (   $opts->{cond}
-				&& $opts->{cond}{$v}
-				&& $csv->parse( $opts->{cond}{$v} ) )
-			{
-
-			# Set condition on static variable (i.e. variable from static table)
-				my @cond = grep ( s/^\s*|\s*$//g, $csv->fields );
-				$param{$table_type}{-having}{"`$v`"} =
-				  { $cond[0] => [ @cond[ 1 .. $#cond ] ] };
-			}
-		}
-
-		else {
-
-	  # Build conditions for visit variables e.g. v1.var, vLast.var, vAny.var etc.
-	  # Values inside array references are joined as 'OR' and hashes as 'AND'
-			my @visit_var =
-			  grep( /^(v(Any|Last|[0-9]+)\.$v|$v)$/, keys %{ $opts->{cond} } );
-
-			for my $vv ( sort @visit_var ) {
-
-				# Parse conditions
-				my @cond = grep ( s/^\s*|\s*$//g, $csv->fields )
-				  if ( $csv->parse( $opts->{cond}{$vv} ) );
-
+   # Build conditions for visit variables e.g. v1.var, vLast.var, vAny.var etc.
+   # Values inside array references are joined as 'OR' and hashes as 'AND'
+   my @visit_vars =
+     grep( /^((vAny|vLast|$visit_regex)\.$var|$var)$/, keys %{ $opts->{cond} } );
+  
+   tie my %vv_col, 'Tie::IxHash', @{ $param{$table_type}{-columns} };
+   
+   for my $vv (@visit_vars) {
+    my (@conds, $opr);
+       if ( $csv->parse( $opts->{cond}{$vv} ) ) {
+          ( $opr, @conds ) =  grep ( s/^\s*|\s*$//g, $csv->fields );
+            $opr = $dialect->$opr || $opr;
+       }
     # Last visits (i.e. vLast) for entities are not known in advance so practically any
     # visit can be the last visit for any entity
-				if ( $vv =~ /^(vLast\.$v)$/ ) {
-					if ( defined $param{$table_type}{-having}{-or} ) {
-						map {
-							${ $param{$table_type}{-having}{-or} }[$_]
-							  ->{ "`v" . ( $_ + 1 ) . ".$v`" } =
-							  { $cond[0] => [ @cond[ 1 .. $#cond ] ] }
-						} 0 .. $#{ $param{$table_type}{-having}{-or} };
-					}
-					else {
-						$param{$table_type}{-having}{-or} = [
-							map {
-								{
-									'vLast' => { -ident => $_ },
-									"`v$_.$v`" =>
-									  { $cond[0] => [ @cond[ 1 .. $#cond ] ] }
-								}
-							  } @visit
-						];
-					}
-				}
+    if ( $vv =~ /^vLast\.$var$/ ) {
+     if ( defined $param{$table_type}{-having}{-or} ) {
+      # Get all visit representations of the variable from %vv_col
+      my @c = grep { $_ =~ /\.$var$/ } keys %vv_col;
+    
+      for ( 0 .. $#{ $param{$table_type}{-having}{-or} } ) {
+       my $alias = $aliase_in_having ? "`$c[$_]`" : $vv_col{ $c[$_] };
+       ${ $param{$table_type}{-having}{-or} }[$_]->{$alias} =
+         { $opr => \@conds };
+      }
+     }
+    
+     else {
+      my $lv = $aliase_in_having ? '`vLast`' : $dialect->substring( $visit, '@@', -1 );
+      my @lvc;
+      
+      for ( keys %$visit_info ) {
+       my $vc = "$visit_info->{$_}{name}.$var";
+       push @lvc,
+         {
+           $lv => { -ident => "'$_'" },
+           (
+             $aliase_in_having
+             ? "`$vc`"
+             : $vv_col{"$vc"}
+             ) => { $opr => \@conds }
+         };
+      }
+      $param{$table_type}{-having}{-or} = \@lvc;
+     }
+    }
 
-				# vAny includes all visit variables joined as 'OR'
-				elsif ( $vv =~ /^(vAny\.$v)$/ ) {
-					if ( defined $param{$table_type}{-having}{-and} ) {
-						push @{ $param{$table_type}{-having}{-and} }, [
-							map {
-								{ "`v$_.$v`" =>
-									  { $cond[0] => [ @cond[ 1 .. $#cond ] ] } }
-							  } @visit
-						];
-					}
+    # vAny includes all visit variables joined as 'OR'
+    elsif ( $vv =~ /^vAny\.$var$/ ) {
+     my @avc;
+     
+     for ( keys %$visit_info ) {
+      my $vc = "$visit_info->{$_}{name}.$var";
+      my $alias = $aliase_in_having ? "`$vc`" : $vv_col{"$vc"};
+      push @avc, $alias => { $opr => \@conds };
+     }
+     
+     if ( defined $param{$table_type}{-having}{-and} ) {
+      push @{ $param{$table_type}{-having}{-and} }, \@avc;
+     }
+     else {
+      $param{$table_type}{-having}{-and} = [ { -or => \@avc } ];
+     }
+    }
 
-					else {
-						$param{$table_type}{-having}{-and} = [
-							{
-								-or => [
-									map {
-										{
-											"`v$_.$v`" => {
-												$cond[0] =>
-												  [ @cond[ 1 .. $#cond ] ]
-											}
-										}
-									  } @visit
-								]
-							}
-						];
-					}
-				}
-
-				# Individual visits (v1.var, v2.var, v3.var etc.)
-				elsif ( $vv =~ /^v[0-9]{1,2}\.$v$/ ) {
-					my @var_cond = grep ( s/^\s*|\s*$//g, $csv->fields )
-					  if ( $csv->parse( $opts->{cond}{$v} ) );
-					if ( $param{$table_type}{-having}{"`$vv`"} ) {
-						$param{$table_type}{-having}{"`$vv`"} = [
-							-and => { $cond[0] => [ @cond[ 1 .. $#cond ] ] },
-							[
-								-or => {
-									$var_cond[0] =>
-									  [ @var_cond[ 1 .. $#var_cond ] ]
-								},
-								{ '=', undef }
-							]
-						];
-					}
-					else {
-						$param{$table_type}{-having}{"`$vv`"} =
-						  { $cond[0] => [ @cond[ 1 .. $#cond ] ] };
-					}
-				}
+    # Individual visits (v1.var, v2.var, v3.var etc.)
+    elsif ( $vv =~ /^(?:$visit_regex)\.$var$/ ) {
+     my ( $vv_opr, @vv_conds ) = grep ( s/^\s*|\s*$//g, $csv->fields )
+       if $csv->parse( $opts->{cond}{$vv} );
+     
+     my $alias = $aliase_in_having ? "`$vv`" : $vv_col{$vv};
+     
+     if ( $param{$table_type}{-having}{$alias} ) {
+      $param{$table_type}{-having}{$alias} = [
+                   -and => { $opr => \@conds },
+                   [
+                    -or => { ( $dialect->$vv_opr || $vv_opr ) => \@vv_conds },
+                    { '=', undef }
+                   ]
+      ];
+     }
+     else {
+      $param{$table_type}{-having}{$alias} =
+        { $opr => \@conds };
+     }
+    }
 
     # When condition is imposed on a variable (with no prefix v1, v2, vLast, vAny)
     # assume condition applies to all visits of the variable (i.e. 'AND' case)
-				else {
-					map {
-						$param{$table_type}{-having}{"`v$_.$v`"} = [
-							{ $cond[0] => [ @cond[ 1 .. $#cond ] ] },
-							{ '=', undef }
-						  ]
-					} @visit;
+    else {
+     for ( keys %$visit_info ) {
+      my $vc = "$visit_info->{$_}{name}.$var";
+      my $alias = $aliase_in_having ? "`$vc`" : $vv_col{"$vc"};
+      $param{$table_type}{-having}{$alias} =
+        [ { $opr => \@conds }, { '=', undef } ];
+     }
+    }
+   }
+  }
+ }
+ 
+ ##---- ADD IDENTIFIER, VISIT AND GROUP BY COLUMNS ----##
+ for ( keys %param ) {
+  if ( $_ eq 'dynamic' ) {
+   unshift @{ $param{$_}{-columns} },
+     (
+       'vFirst' => $dialect->substring( $visit, '@@',  1 ),
+       'vLast'  => $dialect->substring( $visit, '@@', -1 ),
+       'visit'  => $visit
+     );
+  }
+  
+  ###--- PARAMETERS COMMON TO BOTH STATIC AND DYNAMIC TABLE TYPES ---###
+  unshift @{ $param{$_}{-columns} }, entity_id => $map{entity_id};
+ 
+  if ( $opts->{cond} && $opts->{cond}{entity_id} ) {
+   # Set condition on entity_id
+   my $alias = $aliase_in_having ? 'entity_id' : $map{entity_id};
+   my ( $opr, @conds ) = split /\s*,\s*/, $opts->{cond}{entity_id};
+   $param{$_}{-having}{$alias} = { ( $dialect->$opr || $opr ) =>  \@conds };
+  }
+ 
+  $param{$_}{-from} = $struct->{-from};
+ 
+  $param{$_}{-where} =
+    $struct->{-where}
+    ? { %{ $param{$_}{-where} }, %{ $struct->{-where} } }
+    : $param{$_}{-where};
+ 
+  $param{$_}{-group_by} = 'entity_id';
 
-				}
-
-			}
-		}
-
-	}
-
-	for ( keys %param ) {
-		if ( $_ eq 'static' ) {
-			unshift @{ $param{$_}{-columns} },
-			  $struct->{-columns}{entity_id} . ' AS `entity_id`';
-		}
-
-		else {
-
-		 # entity_id and visit are added to the list of SQL cols in dynamic param
-			unshift @{ $param{$_}{-columns} },
-			  (
-				$struct->{-columns}{entity_id} . ' AS `entity_id`',
-				'MIN( ' . $struct->{-columns}{visit} . ' + 0 ) AS `vFirst`',
-				'MAX( ' . $struct->{-columns}{visit} . ' + 0 ) AS `vLast`',
-				'GROUP_CONCAT( DISTINCT '
-				  . $struct->{-columns}{visit}
-				  . ') AS `visit`'
-			  );
-
-			if (   $opts->{cond}
-				&& $opts->{cond}{visit}
-				&& $csv->parse( $opts->{cond}{visit} ) )
-			{
-
-				# Set condition on visit
-				my @cond = grep ( s/^\s*|\s*$//g, $csv->fields );
-				$param{$_}{-having}{visit} =
-				  { $cond[0] => [ @cond[ 1 .. $#cond ] ] };
-			}
-		}
-
-		$param{$_}{-from} = $struct->{-from};
-		$param{$_}{-where} =
-		  $struct->{-where}
-		  ? { %{ $param{$_}{-where} }, %{ $struct->{-where} } }
-		  : $param{$_}{-where};
-
-		$param{$_}{-group_by} = 'entity_id';
-		$param{$_}{-order_by} = 'entity_id + 0';
-
-		if (   $opts->{cond}
-			&& $opts->{cond}{entity_id}
-			&& $csv->parse( $opts->{cond}{entity_id} ) )
-		{
-
-			# Set condition on entity_id
-			my @cond = grep ( s/^\s*|\s*$//g, $csv->fields );
-			$param{$_}{-having}{entity_id} =
-			  { $cond[0] => [ @cond[ 1 .. $#cond ] ] };
-		}
-
-		# Make sure condition on 'tables' has no duplicate placeholders
-		$param{$_}{-where}{ $struct->{-columns}{table} }{-in} = [
-			keys %{
-				{
-					map { $_ => 1 }
-					  @{ $param{$_}{-where}{ $struct->{-columns}{table} }{-in} }
-				}
-			  }
-		];
-
-	}
-
-	return \%param;
+  # Make sure condition on 'tables' has no duplicate placeholders
+  $param{$_}{-where}{ $map{table} }{-in} = [
+    keys %{ { map { $_ => 1 } @{ $param{$_}{-where}{ $map{table} }{-in} } } } ];
+ }
+ return \%param;
 }
 
 sub process_result {
+ my ( $self, $opts, $rs, $dir, @args ) = @_;
+ my ( $ds, $csv ) = @{ $self->cache->get('cache') }{qw/datasource csv/};
+ my $visit_info = $ds->visit_info;
+ my $var_info   = $ds->variable_info;
+ my $table_info = $ds->table_info;
 
-	my ( $self, $opts, $rs, $dir, @args ) = @_;
-
-    # Header of the csv must pay attention to args and variables on which the condition is imposed
-    # Extract visit specific variables from the result-set based on the variables provided as args/cond (option).
-    # Say, variables in args/cond variables are v1.var and vLast.var but as the result-set contains all visits of
-    # the variable 'var' so discard v2.var and v3.var and select v1.var and the equivalent vLast.var
-	my $index = $rs->[0][3] && $rs->[0][3] eq 'visit' ? 3 : 0;
-
-	# Compiling regex to extract variables specified as args/cond (option)
-	my $regex = join '|', map { s/^vAny\.//; $_ } @args,
-	  keys %{ $opts->{cond} };
-
-	$regex = qr/$regex/;
-
-	my @index_to_use = sort { $a <=> $b } keys %{
-		{
-			map { $_ => 1 } (
-				0 .. $index,
-				grep( $rs->[0][$_] =~ $regex, 0 .. $#{ $rs->[0] } )
-			)
-		}
-	  };
-
-	my @var = @{ $rs->[0] }[@index_to_use];
-
-    # Extract last visit specific variables (i.e. vLast.var) in args/cond (option)
-	my @last_visit_var = keys %{
-		{
-			map { $_ => 1 }
-			  grep( /^vLast\./, ( @args, keys %{ $opts->{cond} } ) )
-		}
-	  };
-
-	# Entities from the query are stored within a list
-	my @rs_entity;
-
-	my $file = File::Spec->catfile( $dir, "QueryOutput.csv" );
-
-	my $fh = FileHandle->new("> $file")
-	  or throw_cmd_run_exception( error => "Failed to open file: $!" );
-
-	my @column = ( @var, @last_visit_var );
-
-	my $csv = $self->cache->get('cache')->{csv};
-
-	$csv->print( $fh, \@column )
-	  or throw_cmd_run_exception( error => $csv->error_diag );
-
-	for my $row ( 1 .. $#$rs ) {
-		push @rs_entity, $rs->[$row][0];
-
-		# Sort visits in the visit column
-		if ( $index == 3 ) {
-			$rs->[$row][3] =
-			  join( ', ', ( sort { $a <=> $b } split ',', $rs->[$row][3] ) );
-		}
-
-		my @last_visit_column =
-		  map { s/^vLast\.//; "v$rs->[$row][2].$_" } @last_visit_var;
-
-		my @last_visit_val;
-
-		for my $col (@last_visit_column) {
-			my ($index) = grep { $rs->[0][$_] eq $col } 0 .. $#{ $rs->[0] };
-			push @last_visit_val, $rs->[$row][$index];
-		}
-
-		my @val =
-		  ( ( map { $rs->[$row][$_] } @index_to_use ), @last_visit_val );
-
-		$csv->print( $fh, \@val )
-		  or throw_cmd_run_exception( error => $csv->error_diag );
-	}
-
-	$fh->close;
-	return \@rs_entity;
+ # Header of the csv must pay attention to args and variables on which the condition is imposed
+ # Extract visit specific variables from the result-set based on the variables provided as args/cond (option).
+ # Say, variables in args/cond variables are v1.var and vLast.var but as the result-set contains all visits of
+ # the variable 'var' so discard v2.var and v3.var and select v1.var and the equivalent vLast.var
+ my $index = $rs->[0][3] && $rs->[0][3] eq 'visit' ? 3 : 0;
+ my @cols = $index == 0 ? qw/entity_id/ : qw/entity_id vFirst vLast visit/;
+ my @args_cond_vars = grep ( $_ ne 'entity_id', @args, keys %{ $opts->{cond} } );
+ 
+ for my $var ( @args_cond_vars ) {
+     if ( ( $var_info->{$var} && $table_info->{$var_info->{$var}{table}}{__type__} eq 'dynamic' ) || $var =~ /^vAny\./ ) {
+         my $v = $var =~ /^vAny\.(.+)$/ ? $1 : $var;
+         # Avoid repeating visit variables
+         # variable 'var' without prefix or with prefix 'vAny' corresponds 
+         # to all visits of 'var'
+         for my $visit ( keys %$visit_info ) {
+               if ( !grep ( $_ eq "$visit_info->{$visit}{name}.$v", @cols ) ) {
+                    push @cols, "$visit_info->{$visit}{name}.$v";
+               }
+         }
+     }
+     # Static and visit specific variables (e.g. v1.Var, v2.Var, vLast.Var )
+     else {
+         if ( !grep ( $_ eq $var, @cols ) ) {
+              push @cols, $var;
+         }    
+     }
+ }
+ 
+ my @rs_entity;
+ my $file = File::Spec->catfile( $dir, 'QueryOutput.csv' );
+ my $fh = FileHandle->new("> $file")
+   or throw_cmd_run_exception( error => "Failed to open file: $!" );
+ 
+ $csv->print( $fh, \@cols )
+   or throw_cmd_run_exception( error => $csv->error_diag );
+ 
+ for my $r ( 1 .. $#$rs ) {
+  push @rs_entity, $rs->[$r][0];
+  my @vals;
+  for my $c (@cols) {
+   if ( $c eq 'visit' ) {
+    ( my $val = $rs->[$r][$index] ) =~ s/\@\@/, /g;
+    push @vals, $val;
+   }
+   elsif ( $c eq 'vFirst' ) {
+    push @vals, $rs->[$r][1];
+   }
+   elsif ( $c eq 'vLast' ) {
+    push @vals, $rs->[$r][2];
+   }
+   elsif ( $c =~ /^vLast\.(.+)$/ ) {
+    my ($pos) = grep ( $rs->[0][$_] eq "$visit_info->{$vals[2]}{name}.$1",
+                       0 .. $#{ $rs->[0] } );
+    push @vals, $rs->[$r][$pos];
+   }
+   else {
+    my ($pos) = grep ( $rs->[0][$_] eq $c, 0 .. $#{ $rs->[0] } );
+    push @vals, $rs->[$r][$pos];
+   }
+  }
+  $csv->print( $fh, \@vals )
+    or throw_cmd_run_exception( error => $csv->error_diag );
+ }
+ $fh->close;
+ return \@rs_entity;
 }
 
 sub process_table {
+ my ( $self, $table, $ts, $dir, $rs_entity ) = @_;
+ my ( $ds, $csv ) = @{ $self->cache->get('cache') }{qw/datasource csv/};
+ my $table_info = $ds->table_info;
+ my $var_info   = $ds->variable_info;
+ my $visit_info = $ds->visit_info;
+ my ( @vars, %data );
+ if ( $table_info->{$table}{__type__} eq 'static' ) {
+  for ( keys %$var_info ) {
+   if ( $var_info->{$_}{table} eq $table ) {
+    push @vars, $var_info->{$_}{variable};
+   }
+  }
+ }
+ else {
 
-	my ( $self, $table, $ts, $dir, $rs_entity ) = @_;
+  # All visits applicable to the table
+  for my $v ( keys %$visit_info ) {
+   if ( grep ( $_ eq $table, @{ $visit_info->{$v}{tables} } ) ) {
+    for ( keys %$var_info ) {
+     if ( $var_info->{$_}{table} eq $table ) {
+      push @vars, "$visit_info->{$v}{name}.$var_info->{$_}{variable}";
+     }
+    }
+   }
+  }
+ }
+ 
+ for (@$ts) {
+  # For static tables in longitudinal datasources table data comprise of
+  # entity_id and values of all table variables and in dynamic tables
+  # (longitudinal datasources only) it contains an additional column visit
+  if ( $table_info->{$table}{__type__} eq 'static' ) {
+         $data{ $_->[0] }{ $_->[1] } = $_->[2];
+  }
+  else {
+         $data{ $_->[0] }{"$visit_info->{$_->[3]}{name}.$_->[1]"} = $_->[2];
+  }
+ }
 
-	my ( $ds, $csv ) = @{ $self->cache->get('cache') }{qw/datasource csv/};
+ # Write table data
+ my $file = File::Spec->catfile( $dir, 'data.csv' );
+ my $untaint = $1 if $file =~ /^(.+)$/;
+ my $fh = FileHandle->new("> $untaint")
+   or throw_cmd_run_exception( error => "Failed to open file: $!" );
+   
+ my @cols = ( qw/entity_id/, @vars );
+ $csv->print( $fh, \@cols )
+   or throw_cmd_run_exception( error => $csv->error_diag );
 
-	my @static_table = @{ $ds->static_tables || [] };
-
-	my $table_type =
-	  $ds->type eq 'standard'
-	  ? 'static'
-	  : ( grep ( $_ eq $table, @static_table ) ? 'static' : 'dynamic' );
-
-	# Extract the variables appertaining to the table from the variable list
-	my @var = map { /^$table\.(.+)$/ ? $1 : () } keys %{ $ds->variables };
-
-	my %data;
-
-	# Get variables for static/dynamic tables
-	my @header =
-	    $table_type eq 'static'
-	  ? @var
-	  : map {
-		my $visit = $_;
-		map { "v$visit.$_" } @var
-	  } 1 .. $ds->visit_max;
-
-	for (@$ts) {
-
-		# For static tables in longitudinal datasources table data comprise of
-		# entity_id and values of all table variables
-		# and in dynamic tables (longitudinal datasources only) it contains
-		# an additional column visit
-		if ( $table_type eq 'static' ) {
-			$data{ $_->[0] }{ $_->[1] } = $_->[2];
-		}
-
-		else {
-			$data{ $_->[0] }{ 'v' . $_->[3] . '.' . $_->[1] } = $_->[2];
-		}
-	}
-
-	# Write table data
-	my $file = File::Spec->catfile( $dir, "$table.csv" );
-
-	my $untainted = $1 if ( $file =~ /^(.+)$/ );
-
-	my $fh = FileHandle->new("> $untainted")
-	  or throw_cmd_run_exception( error => "Failed to open file: $!" );
-
-	my @column = ( qw(entity_id), @header );
-
-	$csv->print( $fh, \@column )
-	  or throw_cmd_run_exception( error => $csv->error_diag );
-
-	# Write data for entities present in the result set
-	for my $entity (@$rs_entity) {
-
-		my @val = ( $entity, map { $data{$entity}{$_} } @header );
-
-		$csv->print( $fh, \@val )
-		  or throw_cmd_run_exception( error => $csv->error_diag );
-	}
-
-	$fh->close;
+ # Write data for entities present in the result set
+ for my $entity (@$rs_entity) {
+  my @vals = ( $entity, map { $data{$entity}{$_} } @vars );
+  $csv->print( $fh, \@vals )
+    or throw_cmd_run_exception( error => $csv->error_diag );
+ } 
+ $fh->close;
 }
 
 sub create_dataset {
+ my ( $self, $rs ) = @_;
+ my $visit_info = $self->cache->get('cache')->{datasource}->visit_info;
+ my $index = $rs->[0][3] && $rs->[0][3] eq 'visit' ? 3 : 0;
+ my ( @vars, %data );
 
-	my ( $self, $rs ) = @_;
-	my $index = $rs->[0][3] && $rs->[0][3] eq 'visit' ? 3 : 0;
-	my %data;
+ # Remove visit suffix vAny, vLast, v1, v2 etc. from variables
+ # in the result-set (i.e. args/cond (option))
+ my $regex = 'vLast|' . join( '|', map { $visit_info->{$_}{name} } keys %$visit_info );
+ 
+ for my $v ( @{ $rs->[0] }[ $index + 1 .. $#{ $rs->[0] } ] ) {
+  $v =~ s/^(?:$regex)\.//;
+  if ( !grep ( $_ eq $v, @vars ) ) {
+   push @vars, $v;
+  }
+ }
 
-	# Remove visit suffix vAny, vLast, v1, v2 etc. from the variables
-	# in the result-set (i.e. args/cond (option))
-	my @var = keys %{
-		{
-			map { s/^v(Any|Last|[0-9]+)\.//; $_ => 1 }
-			  @{ $rs->[0] }[ $index + 1 .. $#{ $rs->[0] } ]
-		}
-	  };
-
-	# Generate dataset for calculating summary statistics from the result-set
-	for my $r ( 1 .. $#$rs ) {
-		for my $v (@var) {
-
-			$data{ $rs->[$r][0] }{$v} =
-			  [ map { $rs->[0][$_] =~ /$v$/ ? $rs->[$r][$_] || () : () }
-				  $index + 1 .. $#{ $rs->[0] } ];
-
-			if ( $index != 0 ) {
-				$data{ $rs->[$r][0] }{'visit'} =
-				  [ split ',', $rs->[$r][$index] ];
-			}
-
-		}
-	}
-
-	return ( \%data, 1, ( $index == 0 ? qw/entity_id/ : qw/entity_id visit/ ),
-		@var );
+ # Create dataset for calculating summary statistics
+ for my $r ( 1 .. $#$rs ) {
+  for my $v (@vars) {
+   my @ds;
+   for my $i ( $index + 1 .. $#{ $rs->[0] } ) {
+      push @ds,  $rs->[0][$i] =~ /$v$/ ? $rs->[$r][$i] || () : ()
+   }
+   $data{ $rs->[$r][0] }{$v} = \@ds;
+   
+   $data{ $rs->[$r][0] }{'visit'} = [ split '@@', $rs->[$r][$index] ]
+     if $index == 3;
+  }
+  
+ }
+ return ( \%data, 1, ( $index == 0 ? qw/entity_id/ : qw/entity_id visit/ ),
+          @vars );
 }
 
 #-------
 1;
-
 __END__
 
 =pod
@@ -553,7 +506,8 @@ Show summary statistics
 
 =item B<-c> I<COND>, B<--cond>=I<COND>
             
-Impose conditions using the operators: C<=>, C<!=>, C<E<gt>>, C<E<lt>>, C<E<gt>=>, C<E<lt>=>, C<between>, C<not_between>, C<like>, C<not_like>, C<in>, C<not_in>, C<regexp> and C<not_regexp>.
+Impose conditions using the operators: C<=>, C<!=>, C<E<gt>>, C<E<lt>>, C<E<gt>=>, C<E<lt>=>, C<between>, C<not_between>, C<like>, C<not_like>, C<ilike>, C<in>, C<not_in>, C<regexp> 
+and C<not_regexp>.
 
 The keyword C<undef> can be used to specify null.
 
