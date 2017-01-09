@@ -167,6 +167,16 @@ Currently the application does not support the querying of datasources with mult
 
 [Tie::IxHash](https://metacpan.org/pod/Tie::IxHash)
 
+# CITATION
+
+Dixit A, Dobson RJB<br/>
+CohortExplorer: A Generic Application Programming Interface for Entity Attribute Value Database Schemas<br/>
+JMIR Med Inform 2014;2(2):e32<br/>
+URL: [http://medinform.jmir.org/2014/2/e32](http://medinform.jmir.org/2014/2/e32)<br/>
+DOI: 10.2196/medinform.3339<br/>
+PMID: 25601296<br/>
+PMCID: 4288104
+
 # ACKNOWLEDGEMENTS
 
 Many thanks to the authors of all the dependencies used in writing CohortExplorer and also everyone for their suggestions and feedback.
